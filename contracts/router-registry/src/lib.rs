@@ -11,15 +11,20 @@
 //! - Deprecate old versions
 //! - Admin-controlled with ownership transfer
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, String, Symbol, Vec};
+extern crate alloc;
+use alloc::string::ToString;
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+};
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
 pub enum DataKey {
     Admin,
-    Entry(String, u32),   // (name, version) -> ContractEntry
-    Versions(String),     // name -> Vec<u32>
+    Entry(String, u32), // (name, version) -> ContractEntry
+    Versions(String),   // name -> Vec<u32>
+    ContractNames,      // Vec<String> of all registered names
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -53,6 +58,7 @@ pub enum RegistryError {
     InvalidVersion = 7,
     VersionNotFound = 8,
     InvalidConstraint = 9,
+    AllVersionsDeprecated = 10,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -120,7 +126,11 @@ impl RouterRegistry {
             return Err(RegistryError::InvalidVersion);
         }
 
-        if env.storage().instance().has(&DataKey::Entry(name.clone(), version)) {
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Entry(name.clone(), version))
+        {
             return Err(RegistryError::AlreadyRegistered);
         }
 
@@ -140,17 +150,32 @@ impl RouterRegistry {
             registered_by: caller,
         };
 
-        env.storage().instance().set(&DataKey::Entry(name.clone(), version), &entry);
+        env.storage()
+            .instance()
+            .set(&DataKey::Entry(name.clone(), version), &entry);
 
         // Update version list
         let mut versions = Self::get_versions_list(&env, &name);
         versions.push_back(version);
-        env.storage().instance().set(&DataKey::Versions(name.clone()), &versions);
+        env.storage()
+            .instance()
+            .set(&DataKey::Versions(name.clone()), &versions);
 
-        env.events().publish(
-            (Symbol::new(&env, "contract_registered"),),
-            (name, version),
-        );
+        // Update contract names list
+        let mut names: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractNames)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !names.contains(&name) {
+            names.push_back(name.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::ContractNames, &names);
+        }
+
+        env.events()
+            .publish((Symbol::new(&env, "contract_registered"),), (name, version));
 
         Ok(())
     }
@@ -190,6 +215,9 @@ impl RouterRegistry {
     /// * [`RegistryError::NotFound`] — if no non-deprecated entry exists for `name`.
     pub fn get_latest(env: Env, name: String) -> Result<ContractEntry, RegistryError> {
         let versions = Self::get_versions_list(&env, &name);
+        if versions.is_empty() {
+            return Err(RegistryError::NotFound);
+        }
         // Iterate in reverse to find latest non-deprecated
         let len = versions.len();
         let mut i = len;
@@ -205,7 +233,7 @@ impl RouterRegistry {
                 return Ok(entry);
             }
         }
-        Err(RegistryError::NotFound)
+        Err(RegistryError::AllVersionsDeprecated)
     }
 
     /// Get the latest non-deprecated entry matching a semver constraint.
@@ -230,14 +258,14 @@ impl RouterRegistry {
         constraint: Option<String>,
     ) -> Result<ContractEntry, RegistryError> {
         let versions = Self::get_versions_list(&env, &name);
-        
+
         // If no constraint, use get_latest logic
         if constraint.is_none() {
             let len = versions.len();
             let mut i = len;
             while i > 0 {
                 i -= 1;
-                let v = versions.get(i).unwrap();
+                let v = versions.get(i).ok_or(RegistryError::NotFound)?;
                 let entry: ContractEntry = env
                     .storage()
                     .instance()
@@ -247,27 +275,44 @@ impl RouterRegistry {
                     return Ok(entry);
                 }
             }
-            return Err(RegistryError::NotFound);
+            return Err(RegistryError::AllVersionsDeprecated);
         }
 
         let constraint_str = constraint.unwrap();
-        
+        let mut matched_constraint = false;
+
+        if versions.is_empty() {
+            return Err(RegistryError::NotFound);
+        }
+
+        let mut any_constraint_match = false;
+
         // Iterate in reverse to find latest matching non-deprecated version
         let len = versions.len();
         let mut i = len;
         while i > 0 {
             i -= 1;
-            let v = versions.get(i).unwrap();
+            let v = versions.get(i).ok_or(RegistryError::NotFound)?;
             let entry: ContractEntry = env
                 .storage()
                 .instance()
                 .get(&DataKey::Entry(name.clone(), v))
                 .ok_or(RegistryError::NotFound)?;
-            if !entry.deprecated && Self::version_matches_constraint(v, &constraint_str)? {
+            if Self::version_matches_constraint(v, &constraint_str)? {
+                matched_constraint = true;
+            } else {
+                continue;
+            }
+
+            if !entry.deprecated {
                 return Ok(entry);
             }
         }
-        Err(RegistryError::NotFound)
+        if any_constraint_match {
+            Err(RegistryError::AllVersionsDeprecated)
+        } else {
+            Err(RegistryError::NotFound)
+        }
     }
 
     /// Deprecate a specific version of a contract.
@@ -312,11 +357,11 @@ impl RouterRegistry {
         }
 
         entry.deprecated = true;
-        env.storage().instance().set(&DataKey::Entry(name.clone(), version), &entry);
-        env.events().publish(
-            (Symbol::new(&env, "contract_deprecated"),),
-            (name, version),
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Entry(name.clone(), version), &entry);
+        env.events()
+            .publish((Symbol::new(&env, "contract_deprecated"),), (name, version));
         Ok(())
     }
 
@@ -324,19 +369,14 @@ impl RouterRegistry {
         env: Env,
         caller: Address,
         entries: Vec<(String, u32)>,
-    ) -> Vec<Result<(), RegistryError>> {
+    ) -> Result<Vec<Result<(), RegistryError>>, RegistryError> {
         caller.require_auth();
+        Self::require_admin(&env, &caller)?;
         let mut results = Vec::new(&env);
-        if Self::require_admin(&env, &caller).is_err() {
-            for _ in entries.iter() {
-                results.push_back(Err(RegistryError::Unauthorized));
-            }
-            return results;
-        }
         for (name, version) in entries.iter() {
             results.push_back(Self::deprecate_one(&env, name, version));
         }
-        results
+        Ok(results)
     }
 
     /// Transfer admin to a new address.
@@ -355,7 +395,11 @@ impl RouterRegistry {
     /// # Errors
     /// * [`RegistryError::Unauthorized`] — if `current` is not the admin.
     /// * [`RegistryError::NotInitialized`] — if the contract has not been initialized.
-    pub fn transfer_admin(env: Env, current: Address, new_admin: Address) -> Result<(), RegistryError> {
+    pub fn transfer_admin(
+        env: Env,
+        current: Address,
+        new_admin: Address,
+    ) -> Result<(), RegistryError> {
         current.require_auth();
         Self::require_admin(&env, &current)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -374,13 +418,17 @@ impl RouterRegistry {
     /// # Returns
     /// The [`Address`] of the current admin.
     ///
-    /// # Errors
-    /// * [`RegistryError::NotInitialized`] — if the contract has not been initialized.
-    pub fn admin(env: Env) -> Result<Address, RegistryError> {
+    /// # Panics
+    /// * Panics if the contract has not been initialized.
+    /// 
+    /// Note: This is a breaking change from the previous Result-based API.
+    /// Calling admin() on an uninitialized contract is considered a programming error
+    /// rather than a runtime condition, consistent with how similar getters work.
+    pub fn admin(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
-            .ok_or(RegistryError::NotInitialized)
+            .expect("not initialized")
     }
 
     /// Get all registered versions for a name.
@@ -399,14 +447,86 @@ impl RouterRegistry {
         Self::get_versions_list(&env, &name)
     }
 
+    /// Get all contract entries for a name.
+    ///
+    /// Returns all [`ContractEntry`] structs for `name`, including deprecated ones,
+    /// in version order (ascending).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `name` - The human-readable name of the contract.
+    ///
+    /// # Returns
+    /// A [`Vec<ContractEntry>`] of all entries for `name`.
+    pub fn get_all_versions(env: Env, name: String) -> Vec<ContractEntry> {
+        let versions = Self::get_versions_list(&env, &name);
+        let mut entries = Vec::new(&env);
+        for v in versions.iter() {
+            if let Some(entry) = env
+                .storage()
+                .instance()
+                .get(&DataKey::Entry(name.clone(), v))
+            {
+                entries.push_back(entry);
+            }
+        }
+        entries
+    }
+
+    /// Returns all registered contract names in registration order.
+    ///
+    /// Returns a list of all unique contract names that have been registered,
+    /// in the order they were first registered.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Returns
+    /// A [`Vec<String>`] of all registered contract names.
+    pub fn get_all_names(env: Env) -> Vec<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ContractNames)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Find the registry entry for a given contract address.
+    ///
+    /// Returns the first entry found (search order: all names in registration order,
+    /// all versions in ascending order). Returns None if the address is not registered.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `address` - The contract address to look up.
+    ///
+    /// # Returns
+    /// An [`Option<ContractEntry>`] containing the entry if found, None otherwise.
+    pub fn get_entry_by_address(env: Env, address: Address) -> Option<ContractEntry> {
+        let names: Vec<String> = env.storage()
+            .instance()
+            .get(&DataKey::ContractNames)
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        for name in names.iter() {
+            let versions = Self::get_versions_list(&env, &name);
+            for v in versions.iter() {
+                if let Some(entry) = env.storage()
+                    .instance()
+                    .get::<DataKey, ContractEntry>(&DataKey::Entry(name.clone(), v))
+                {
+                    if entry.address == address {
+                        return Some(entry);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(RegistryError::NotInitialized)?;
+        let admin = Self::admin(env.clone());
         if &admin != caller {
             return Err(RegistryError::Unauthorized);
         }
@@ -420,25 +540,38 @@ impl RouterRegistry {
             .unwrap_or(Vec::new(env))
     }
 
-    fn version_matches_constraint(version: u32, constraint: &String) -> Result<bool, RegistryError> {
+    fn version_matches_constraint(
+        version: u32,
+        constraint: &String,
+    ) -> Result<bool, RegistryError> {
         // Parse simple semver constraints: >=X, <=X, >X, <X, ^X, ~X
         let constraint_str = constraint.to_string();
-        
+
         if constraint_str.starts_with(">=") {
-            let min = constraint_str[2..].parse::<u32>().map_err(|_| RegistryError::InvalidConstraint)?;
+            let min = constraint_str[2..]
+                .parse::<u32>()
+                .map_err(|_| RegistryError::InvalidConstraint)?;
             Ok(version >= min)
         } else if constraint_str.starts_with("<=") {
-            let max = constraint_str[2..].parse::<u32>().map_err(|_| RegistryError::InvalidConstraint)?;
+            let max = constraint_str[2..]
+                .parse::<u32>()
+                .map_err(|_| RegistryError::InvalidConstraint)?;
             Ok(version <= max)
         } else if constraint_str.starts_with(">") {
-            let min = constraint_str[1..].parse::<u32>().map_err(|_| RegistryError::InvalidConstraint)?;
+            let min = constraint_str[1..]
+                .parse::<u32>()
+                .map_err(|_| RegistryError::InvalidConstraint)?;
             Ok(version > min)
         } else if constraint_str.starts_with("<") {
-            let max = constraint_str[1..].parse::<u32>().map_err(|_| RegistryError::InvalidConstraint)?;
+            let max = constraint_str[1..]
+                .parse::<u32>()
+                .map_err(|_| RegistryError::InvalidConstraint)?;
             Ok(version < max)
         } else if constraint_str.starts_with("^") {
             // Caret: allows changes that do not modify the left-most non-zero digit
-            let base = constraint_str[1..].parse::<u32>().map_err(|_| RegistryError::InvalidConstraint)?;
+            let base = constraint_str[1..]
+                .parse::<u32>()
+                .map_err(|_| RegistryError::InvalidConstraint)?;
             if base == 0 {
                 Ok(version >= base && version < 1)
             } else {
@@ -446,11 +579,15 @@ impl RouterRegistry {
             }
         } else if constraint_str.starts_with("~") {
             // Tilde: allows patch-level changes
-            let base = constraint_str[1..].parse::<u32>().map_err(|_| RegistryError::InvalidConstraint)?;
+            let base = constraint_str[1..]
+                .parse::<u32>()
+                .map_err(|_| RegistryError::InvalidConstraint)?;
             Ok(version >= base && version < base + 1)
         } else {
             // Try exact match
-            let exact = constraint_str.parse::<u32>().map_err(|_| RegistryError::InvalidConstraint)?;
+            let exact = constraint_str
+                .parse::<u32>()
+                .map_err(|_| RegistryError::InvalidConstraint)?;
             Ok(version == exact)
         }
     }
@@ -462,7 +599,10 @@ impl RouterRegistry {
 mod tests {
     extern crate std;
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Events}, vec, Env, IntoVal, String};
+    use soroban_sdk::{
+        testutils::{Address as _, Events},
+        vec, Env, IntoVal, String,
+    };
 
     fn setup() -> (Env, Address, RouterRegistryClient<'static>) {
         let env = Env::default();
@@ -557,14 +697,18 @@ mod tests {
         client.register(&admin, &name, &addr, &1);
         client.deprecate(&admin, &name, &1);
         let result = client.try_get_latest(&name);
-        assert_eq!(result, Err(Ok(RegistryError::NotFound)));
+        assert_eq!(result, Err(Ok(RegistryError::AllVersionsDeprecated)));
     }
 
     #[test]
     fn test_get_latest_skips_multiple_deprecated_versions() {
         let (env, admin, client) = setup();
         let name = String::from_str(&env, "oracle");
-        let (a1, a2, a3) = (Address::generate(&env), Address::generate(&env), Address::generate(&env));
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
@@ -623,7 +767,10 @@ mod tests {
         assert_eq!(event.0, client.address);
         assert_eq!(
             event.1,
-            vec![&env, Symbol::new(&env, "contract_registered").into_val(&env)]
+            vec![
+                &env,
+                Symbol::new(&env, "contract_registered").into_val(&env)
+            ]
         );
         let (n, v): (String, u32) = event.2.into_val(&env);
         assert_eq!(n, name);
@@ -642,7 +789,10 @@ mod tests {
         assert_eq!(event.0, client.address);
         assert_eq!(
             event.1,
-            vec![&env, Symbol::new(&env, "contract_deprecated").into_val(&env)]
+            vec![
+                &env,
+                Symbol::new(&env, "contract_deprecated").into_val(&env)
+            ]
         );
         let (n, v): (String, u32) = event.2.into_val(&env);
         assert_eq!(n, name);
@@ -674,7 +824,7 @@ mod tests {
         let addr = Address::generate(&env);
         client.register(&admin, &name, &addr, &1);
         client.deprecate(&admin, &name, &1);
-        
+
         // Registering a higher version after deprecation should succeed
         client.register(&admin, &name, &addr, &2);
         let latest = client.get_latest(&name);
@@ -690,10 +840,10 @@ mod tests {
         client.register(&admin, &name, &addr, &2);
         client.deprecate(&admin, &name, &1);
         client.deprecate(&admin, &name, &2);
-        
+
         // When all versions are deprecated, get_latest should return NotFound
         let result = client.try_get_latest(&name);
-        assert_eq!(result, Err(Ok(RegistryError::NotFound)));
+        assert_eq!(result, Err(Ok(RegistryError::AllVersionsDeprecated)));
     }
 
     #[test]
@@ -716,12 +866,17 @@ mod tests {
     fn test_deprecate_many_all_succeed() {
         let (env, admin, client) = setup();
         let name = String::from_str(&env, "oracle");
-        let (a1, a2, a3) = (Address::generate(&env), Address::generate(&env), Address::generate(&env));
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
 
-        let entries = vec![&env,
+        let entries = vec![
+            &env,
             (name.clone(), 1u32),
             (name.clone(), 2u32),
             (name.clone(), 3u32),
@@ -740,7 +895,8 @@ mod tests {
         let addr = Address::generate(&env);
         client.register(&admin, &name, &addr, &1);
 
-        let entries = vec![&env,
+        let entries = vec![
+            &env,
             (name.clone(), 1u32),  // ok
             (name.clone(), 99u32), // VersionNotFound
             (name.clone(), 1u32),  // AlreadyDeprecated
@@ -748,22 +904,29 @@ mod tests {
         let results = client.deprecate_many(&admin, &entries);
         assert_eq!(results.get(0).unwrap(), Ok(()));
         assert_eq!(results.get(1).unwrap(), Err(RegistryError::VersionNotFound));
-        assert_eq!(results.get(2).unwrap(), Err(RegistryError::AlreadyDeprecated));
+        assert_eq!(
+            results.get(2).unwrap(),
+            Err(RegistryError::AlreadyDeprecated)
+        );
     }
 
     #[test]
     fn test_get_latest_with_constraint_exact_match() {
         let (env, admin, client) = setup();
         let name = String::from_str(&env, "oracle");
-        let (a1, a2, a3) = (Address::generate(&env), Address::generate(&env), Address::generate(&env));
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
-        
+
         let constraint = String::from_str(&env, "2");
         let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
         assert!(result.is_ok());
-        let entry = result.unwrap();
+        let entry = result.unwrap().unwrap();
         assert_eq!(entry.version, 2);
     }
 
@@ -771,15 +934,19 @@ mod tests {
     fn test_get_latest_with_constraint_gte() {
         let (env, admin, client) = setup();
         let name = String::from_str(&env, "oracle");
-        let (a1, a2, a3) = (Address::generate(&env), Address::generate(&env), Address::generate(&env));
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
-        
+
         let constraint = String::from_str(&env, ">=2");
         let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
         assert!(result.is_ok());
-        let entry = result.unwrap();
+        let entry = result.unwrap().unwrap();
         assert_eq!(entry.version, 3);
     }
 
@@ -787,15 +954,19 @@ mod tests {
     fn test_get_latest_with_constraint_lt() {
         let (env, admin, client) = setup();
         let name = String::from_str(&env, "oracle");
-        let (a1, a2, a3) = (Address::generate(&env), Address::generate(&env), Address::generate(&env));
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
-        
+
         let constraint = String::from_str(&env, "<3");
         let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
         assert!(result.is_ok());
-        let entry = result.unwrap();
+        let entry = result.unwrap().unwrap();
         assert_eq!(entry.version, 2);
     }
 
@@ -803,15 +974,19 @@ mod tests {
     fn test_get_latest_with_constraint_caret() {
         let (env, admin, client) = setup();
         let name = String::from_str(&env, "oracle");
-        let (a1, a2, a3) = (Address::generate(&env), Address::generate(&env), Address::generate(&env));
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
-        
+
         let constraint = String::from_str(&env, "^2");
         let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
         assert!(result.is_ok());
-        let entry = result.unwrap();
+        let entry = result.unwrap().unwrap();
         assert_eq!(entry.version, 2);
     }
 
@@ -822,7 +997,7 @@ mod tests {
         let (a1, a2) = (Address::generate(&env), Address::generate(&env));
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
-        
+
         let constraint = String::from_str(&env, ">=5");
         let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
         assert_eq!(result, Err(Ok(RegistryError::NotFound)));
@@ -832,16 +1007,168 @@ mod tests {
     fn test_get_latest_with_constraint_skips_deprecated() {
         let (env, admin, client) = setup();
         let name = String::from_str(&env, "oracle");
-        let (a1, a2, a3) = (Address::generate(&env), Address::generate(&env), Address::generate(&env));
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
         client.deprecate(&admin, &name, &3);
-        
+
         let constraint = String::from_str(&env, ">=2");
         let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
         assert!(result.is_ok());
-        let entry = result.unwrap();
+        let entry = result.unwrap().unwrap();
         assert_eq!(entry.version, 2);
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_all_deprecated_returns_all_versions_deprecated() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
+        client.register(&admin, &name, &a1, &1);
+        client.register(&admin, &name, &a2, &2);
+        client.register(&admin, &name, &a3, &3);
+        client.deprecate(&admin, &name, &1);
+        client.deprecate(&admin, &name, &2);
+        client.deprecate(&admin, &name, &3);
+        let constraint = String::from_str(&env, ">=1");
+        let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
+        assert_eq!(result, Err(Ok(RegistryError::AllVersionsDeprecated)));
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_empty_registry() {
+        let (env, _admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let constraint = String::from_str(&env, ">=1");
+        let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
+        assert_eq!(result, Err(Ok(RegistryError::NotFound)));
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_invalid_constraint() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+
+        let bad_constraint = String::from_str(&env, "abc");
+        let result = client.try_get_latest_with_constraint(&name, &Some(bad_constraint));
+        assert_eq!(result, Err(Ok(RegistryError::InvalidConstraint)));
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_none_behaves_like_get_latest() {
+        // Verifies the no-constraint path returns the same result as get_latest
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+        let latest = client.get_latest(&name);
+        let constrained = client.get_latest_with_constraint(&name, &None);
+        assert_eq!(latest.version, constrained.version);
+        assert_eq!(latest.address, constrained.address);
+    }
+
+    #[test]
+    fn test_constraint_all_deprecated_returns_all_deprecated() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+        client.register(&admin, &name, &addr, &2);
+        client.register(&admin, &name, &addr, &3);
+        client.deprecate(&admin, &name, &1);
+        client.deprecate(&admin, &name, &2);
+        client.deprecate(&admin, &name, &3);
+
+        let constraint = String::from_str(&env, ">=1");
+        let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
+        assert_eq!(result, Err(Ok(RegistryError::AllVersionsDeprecated)));
+    }
+
+    #[test]
+    fn test_constraint_no_matching_version_returns_not_found() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let (a1, a2) = (Address::generate(&env), Address::generate(&env));
+        client.register(&admin, &name, &a1, &1);
+        client.register(&admin, &name, &a2, &2);
+
+        let constraint = String::from_str(&env, ">=5");
+        let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
+        assert_eq!(result, Err(Ok(RegistryError::NotFound)));
+    }
+
+    #[test]
+    fn test_get_all_names_empty() {
+        let (env, _admin, client) = setup();
+        let names = client.get_all_names();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_names_multiple() {
+        let (env, admin, client) = setup();
+        let name1 = String::from_str(&env, "oracle");
+        let name2 = String::from_str(&env, "vault");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+
+        client.register(&admin, &name1, &addr1, &1);
+        client.register(&admin, &name2, &addr2, &1);
+
+        let names = client.get_all_names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&name1));
+        assert!(names.contains(&name2));
+    }
+
+    #[test]
+    fn test_get_all_names_no_duplicates() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+
+        client.register(&admin, &name, &addr1, &1);
+        client.register(&admin, &name, &addr2, &2);
+
+        let names = client.get_all_names();
+        assert_eq!(names.len(), 1);
+        assert!(names.contains(&name));
+    }
+
+    #[test]
+    fn test_get_all_versions_includes_deprecated() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let a1 = Address::generate(&env);
+        let a2 = Address::generate(&env);
+        client.register(&admin, &name, &a1, &1);
+        client.register(&admin, &name, &a2, &2);
+        client.deprecate(&admin, &name, &1);
+
+        let entries = client.get_all_versions(&name);
+        assert_eq!(entries.len(), 2);
+        let v1 = entries.iter().find(|e| e.version == 1).unwrap();
+        let v2 = entries.iter().find(|e| e.version == 2).unwrap();
+        assert!(v1.deprecated);
+        assert!(!v2.deprecated);
+    }
+
+    #[test]
+    fn test_get_all_versions_empty_for_unknown_name() {
+        let (env, _admin, client) = setup();
+        let name = String::from_str(&env, "unknown");
+        assert!(client.get_all_versions(&name).is_empty());
     }
 }

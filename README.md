@@ -43,6 +43,14 @@ composable, upgradeable, and access-controlled multi-contract systems on Soroban
 | `router-timelock` | Delayed execution queue for sensitive configuration changes | 7 |
 | `router-multicall` | Batch multiple cross-contract calls in one transaction | 6 |
 
+## Metrics & Monitoring
+
+| Component | Description |
+|---|---|
+| `router-metrics-exporter` | Prometheus/OpenTelemetry metrics exporter (off-chain binary) |
+
+The metrics exporter is an off-chain Rust binary that polls the Soroban RPC endpoint and exposes contract metrics in Prometheus format. See [`metrics/README.md`](metrics/README.md) for details.
+
 ## Architecture
 
 ### router-core
@@ -89,22 +97,65 @@ setting `max_batch_size`).
 ## Getting Started
 
 ### Prerequisites
-- Rust (stable)
-- Soroban CLI: `cargo install --locked stellar-cli`
 
-### Build
+| Tool | Install |
+|---|---|
+| Rust (stable) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| wasm32 target | `rustup target add wasm32-unknown-unknown` |
+| Stellar CLI | `cargo install --locked stellar-cli` |
+| Docker (optional) | [docs.docker.com](https://docs.docker.com/get-docker/) |
+
+### Quick Start (Docker)
+
+The fastest way to get a working environment with no local Rust install:
 
 ```bash
 git clone https://github.com/Maki-Zeninn/stellar-router.git
 cd stellar-router
+
+# Run all unit tests
+docker compose run tests
+
+# Build WASM contract artifacts (output → ./artifacts/)
+docker compose run wasm
+
+# Start metrics stack (exporter + Prometheus + Grafana)
+docker compose up
+```
+
+Grafana is available at http://localhost:3000 (admin / admin).
+Prometheus is available at http://localhost:9091.
+
+### Manual Setup
+
+```bash
+git clone https://github.com/Maki-Zeninn/stellar-router.git
+cd stellar-router
+```
+
+### Build
+
+```bash
 cargo build
 ```
 
 ### Test
 
+Run unit tests:
 ```bash
 cargo test
 ```
+
+Run integration tests on Stellar testnet:
+```bash
+# Quick start
+./scripts/run-integration-tests.sh
+
+# Or manually
+cargo test --test integration_tests -- --ignored --test-threads=1 --nocapture
+```
+
+See [INTEGRATION_TESTS.md](INTEGRATION_TESTS.md) for detailed integration test documentation.
 
 ### Build for Deployment (WASM)
 
@@ -158,6 +209,27 @@ stellar contract deploy \
   --network testnet --source <your-account>
 ```
 
+### Metrics Exporter Deployment
+
+After deploying contracts, set up the metrics exporter to monitor them:
+
+```bash
+cd metrics
+
+# Configure contract IDs
+export ROUTER_CORE_CONTRACT_ID="<your-core-contract-id>"
+export ROUTER_MIDDLEWARE_CONTRACT_ID="<your-middleware-contract-id>"
+export ROUTER_REGISTRY_CONTRACT_ID="<your-registry-contract-id>"
+
+# Run the exporter
+cargo run --release
+
+# Or use Docker Compose (includes Prometheus + Grafana)
+docker-compose up -d
+```
+
+See [`metrics/README.md`](metrics/README.md) for full deployment instructions.
+
 ## Example Usage
 
 ### Register a contract in the router
@@ -194,13 +266,46 @@ stellar contract invoke --id <MIDDLEWARE_ID> --network testnet --source admin \
 ### Queue a timelock operation
 
 ```bash
+# 1. Queue the operation (delay = 86400 seconds = 24 hours)
 stellar contract invoke --id <TIMELOCK_ID> --network testnet --source admin \
   -- queue \
   --proposer <ADMIN_ADDRESS> \
   --description "upgrade oracle to v2" \
   --target <NEW_ORACLE_ADDRESS> \
   --delay 86400
+
+# 2. Wait for the delay to pass (24 hours on testnet)
+
+# 3. Execute the operation after the ETA
+stellar contract invoke --id <TIMELOCK_ID> --network testnet --source admin \
+  -- execute \
+  --caller <ADMIN_ADDRESS> \
+  --op_id <OP_ID_FROM_QUEUE>
+
+# Or cancel it before execution
+stellar contract invoke --id <TIMELOCK_ID> --network testnet --source admin \
+  -- cancel \
+  --caller <ADMIN_ADDRESS> \
+  --op_id <OP_ID_FROM_QUEUE>
 ```
+
+## Troubleshooting
+
+**`cargo build` fails with `wasm32-unknown-unknown` target not found**
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
+**`stellar contract deploy` fails with "account not found"**
+Fund your testnet account using [Stellar Friendbot](https://friendbot.stellar.org/?addr=<YOUR_ADDRESS>).
+
+**Metrics exporter shows no data**
+- Verify the contract IDs are correct and the contracts are initialized.
+- Check that `ROUTER_RPC_URL` points to a live Soroban RPC endpoint.
+- Run `docker compose logs metrics-exporter` to see scrape errors.
+
+**Tests fail with "AlreadyInitialized"**
+Each test must use a fresh `Env::default()` and register a new contract instance. The Soroban test environment is isolated per `Env`, so this should not happen unless a test helper is reusing state.
 
 ## FAQ
 
