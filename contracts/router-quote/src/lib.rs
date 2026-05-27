@@ -9,8 +9,13 @@
 //! ## Features
 //! - Get quote from any registered liquidity plugin
 //! - Returns expected output amount, fees, and route details
+//! - Caller-specified slippage tolerance via `slippage_bps` parameter
+//! - Quote expiration via configurable TTL (`set_quote_ttl` / `get_quote_ttl`)
 //! - Does not execute transactions (read-only preview)
 //! - Works with any plugin implementing the get_quote interface
+//!
+//! ## Events
+//! - `fee_estimated` — emitted on each `estimate_fee` call (total_fee, surge_pricing)
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
