@@ -174,13 +174,8 @@ impl RouterCore {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
 
-        if !Self::is_valid_route_name(&name) {
-            return Err(RouterError::InvalidRouteName);
-        }
-
-        if env.storage().instance().has(&DataKey::Route(name.clone())) {
-            return Err(RouterError::RouteAlreadyExists);
-        }
+        // Use shared validation helper
+        Self::validate_route_name(&env, &name)?;
 
         // Validate metadata if provided
         if let Some(ref meta) = metadata {
@@ -621,21 +616,8 @@ impl RouterCore {
             return Err(RouterError::RouteNotFound);
         }
 
-        // Check alias doesn't already exist as route or alias
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Route(alias_name.clone()))
-        {
-            return Err(RouterError::RouteAlreadyExists);
-        }
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Alias(alias_name.clone()))
-        {
-            return Err(RouterError::RouteAlreadyExists);
-        }
+        // Use shared validation helper for alias name
+        Self::validate_route_name(&env, &alias_name)?;
 
         env.storage()
             .instance()
@@ -834,18 +816,22 @@ impl RouterCore {
     /// `liquidity_score + reliability_score - fee_bps / 10`
     ///
     /// Routes that are paused or have no score are skipped. Returns the name
-    /// of the highest-scoring available route.
+    /// of the highest-scoring available route, or `fallback_name` if no
+    /// candidate meets `min_score`.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
     /// * `candidates` - A list of route names to evaluate.
+    /// * `min_score` - Minimum composite score a route must reach to be selected.
+    /// * `fallback_name` - Returned when no candidate meets `min_score`.
     ///
     /// # Returns
-    /// The name of the best route, or `None` if no scoreable, unpaused route exists.
+    /// The name of the best route, `fallback_name` if none meet the threshold,
+    /// or `None` if no scoreable, unpaused route exists and no fallback is set.
     ///
     /// # Errors
     /// * [`RouterError::RouterPaused`] — if the entire router is paused.
-    pub fn get_best_route(env: Env, candidates: Vec<String>) -> Result<Option<String>, RouterError> {
+    pub fn get_best_route(env: Env, candidates: Vec<String>, min_score: i64, fallback_name: Option<String>) -> Result<Option<String>, RouterError> {
         let paused: bool = env
             .storage()
             .instance()
@@ -856,7 +842,7 @@ impl RouterCore {
         }
 
         let mut best_name: Option<String> = None;
-        let mut best_score: i64 = -1;
+        let mut best_score: i64 = i64::MIN;
 
         for name in candidates.iter() {
             // Skip paused routes
@@ -891,14 +877,20 @@ impl RouterCore {
             }
         }
 
-        if let Some(ref name) = best_name {
-            env.events().publish(
-                (Symbol::new(&env, "best_route_selected"),),
-                (name.clone(), best_score),
-            );
-        }
+        // Apply minimum score threshold: fall back if best doesn't meet it
+        let result = if best_score >= min_score {
+            if let Some(ref name) = best_name {
+                env.events().publish(
+                    (Symbol::new(&env, "best_route_selected"),),
+                    (name.clone(), best_score),
+                );
+            }
+            best_name
+        } else {
+            fallback_name
+        };
 
-        Ok(best_name)
+        Ok(result)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -936,16 +928,37 @@ impl RouterCore {
         s.bytes().all(|b| matches!(b, 9 | 10 | 11 | 12 | 13 | 32))
     }
 
-    /// Returns `true` if `name` passes all route-name constraints:
-    /// - Length ≤ 64 characters
-    /// - Every character is alphanumeric (a-z, A-Z, 0-9), a forward slash `/`,
-    ///   or a hyphen `-`.
-    fn is_valid_route_name(name: &String) -> bool {
-        let s = name.to_string();
-        if s.len() > 64 {
-            return false;
+    /// Validates a route name for use in register_route and add_alias.
+    ///
+    /// Ensures the name is not empty or whitespace-only, and does not conflict
+    /// with existing routes or aliases.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `name` - The route or alias name to validate.
+    ///
+    /// # Returns
+    /// `Ok(())` if the name is valid and available.
+    ///
+    /// # Errors
+    /// * [`RouterError::InvalidRouteName`] — if the name is empty or whitespace-only.
+    /// * [`RouterError::RouteAlreadyExists`] — if the name conflicts with an existing route or alias.
+    fn validate_route_name(env: &Env, name: &String) -> Result<(), RouterError> {
+        if Self::is_empty_or_whitespace(name) {
+            return Err(RouterError::InvalidRouteName);
         }
-        s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'-'))
+
+        // Check if name already exists as a route
+        if env.storage().instance().has(&DataKey::Route(name.clone())) {
+            return Err(RouterError::RouteAlreadyExists);
+        }
+
+        // Check if name already exists as an alias
+        if env.storage().instance().has(&DataKey::Alias(name.clone())) {
+            return Err(RouterError::RouteAlreadyExists);
+        }
+
+        Ok(())
     }
 }
 
@@ -1612,7 +1625,7 @@ mod tests {
         let metadata = Some(RouteMetadata {
             description,
             tags,
-            owner: Some(admin.clone()),
+            owner: Address::generate(&env),
         });
 
         client.register_route(&admin, &name, &addr, &None);
@@ -2065,7 +2078,7 @@ mod tests {
         client.set_route_score(&admin, &r3, &RouteScore { liquidity_score: 60, fee_bps: 50, reliability_score: 60 });
 
         let candidates = vec![&env, r1, r2.clone(), r3];
-        let best = client.get_best_route(&candidates).unwrap();
+        let best = client.get_best_route(&candidates, &0, &None).unwrap();
         assert_eq!(best, Some(r2));
     }
 
@@ -2085,7 +2098,7 @@ mod tests {
         client.set_route_paused(&admin, &r1, &true);
 
         let candidates = vec![&env, r1, r2.clone()];
-        let best = client.get_best_route(&candidates).unwrap();
+        let best = client.get_best_route(&candidates, &0, &None).unwrap();
         assert_eq!(best, Some(r2));
     }
 
@@ -2097,7 +2110,7 @@ mod tests {
         client.register_route(&admin, &r1, &addr, &None);
         // No score set
         let candidates = vec![&env, r1];
-        let best = client.get_best_route(&candidates).unwrap();
+        let best = client.get_best_route(&candidates, &0, &None).unwrap();
         assert_eq!(best, None);
     }
 
@@ -2106,7 +2119,216 @@ mod tests {
         let (env, admin, client) = setup();
         client.set_paused(&admin, &true);
         let candidates = Vec::new(&env);
-        let result = client.try_get_best_route(&candidates);
+        let result = client.try_get_best_route(&candidates, &0, &None);
         assert_eq!(result, Err(Ok(RouterError::RouterPaused)));
+    }
+
+    #[test]
+    fn test_get_best_route_fallback_when_below_min_score() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route_a");
+        let fallback = String::from_str(&env, "fallback_route");
+        let addr = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr, &None);
+        // route_a: 50 + 50 - 10/10 = 99
+        client.set_route_score(&admin, &r1, &RouteScore { liquidity_score: 50, fee_bps: 10, reliability_score: 50 });
+
+        let candidates = vec![&env, r1];
+        // min_score = 200 — route_a (99) doesn't qualify → fallback returned
+        let best = client.get_best_route(&candidates, &200, &Some(fallback.clone())).unwrap();
+        assert_eq!(best, Some(fallback));
+    }
+
+    #[test]
+    fn test_get_best_route_no_fallback_returns_none_when_below_min_score() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route_a");
+        let addr = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr, &None);
+        client.set_route_score(&admin, &r1, &RouteScore { liquidity_score: 10, fee_bps: 0, reliability_score: 10 });
+
+        let candidates = vec![&env, r1];
+        // min_score = 1000 — no route qualifies, no fallback
+        let best = client.get_best_route(&candidates, &1000, &None).unwrap();
+        assert_eq!(best, None);
+    }
+
+    // ── Issue #506: get_all_routes after remove and re-register ──────────────
+
+    #[test]
+    fn test_get_all_routes_count_decrements_after_remove() {
+        let (env, admin, client) = setup();
+        let oracle = String::from_str(&env, "oracle");
+        let vault = String::from_str(&env, "vault");
+        let swap = String::from_str(&env, "swap");
+        let addr = Address::generate(&env);
+
+        // Register 3 routes
+        client.register_route(&admin, &oracle, &addr, &None);
+        client.register_route(&admin, &vault, &addr, &None);
+        client.register_route(&admin, &swap, &addr, &None);
+        assert_eq!(client.get_all_routes().len(), 3);
+
+        // Remove one route
+        client.remove_route(&admin, &vault);
+        
+        // Count should decrement by one
+        let routes = client.get_all_routes();
+        assert_eq!(routes.len(), 2);
+        assert!(routes.contains(&oracle));
+        assert!(!routes.contains(&vault));
+        assert!(routes.contains(&swap));
+    }
+
+    #[test]
+    fn test_get_all_routes_includes_re_registered_route() {
+        let (env, admin, client) = setup();
+        let oracle = String::from_str(&env, "oracle");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+
+        // Register, remove, then re-register
+        client.register_route(&admin, &oracle, &addr1, &None);
+        assert_eq!(client.get_all_routes().len(), 1);
+
+        client.remove_route(&admin, &oracle);
+        assert_eq!(client.get_all_routes().len(), 0);
+
+        client.register_route(&admin, &oracle, &addr2, &None);
+        
+        // Route should be back in the list
+        let routes = client.get_all_routes();
+        assert_eq!(routes.len(), 1);
+        assert!(routes.contains(&oracle));
+    }
+
+    #[test]
+    fn test_get_all_routes_no_duplicates_after_multiple_operations() {
+        let (env, admin, client) = setup();
+        let oracle = String::from_str(&env, "oracle");
+        let vault = String::from_str(&env, "vault");
+        let swap = String::from_str(&env, "swap");
+        let addr = Address::generate(&env);
+
+        // Register multiple routes
+        client.register_route(&admin, &oracle, &addr, &None);
+        client.register_route(&admin, &vault, &addr, &None);
+        client.register_route(&admin, &swap, &addr, &None);
+
+        // Remove and re-register some routes
+        client.remove_route(&admin, &vault);
+        client.register_route(&admin, &vault, &addr, &None);
+        client.remove_route(&admin, &oracle);
+        client.register_route(&admin, &oracle, &addr, &None);
+
+        // Verify no duplicates
+        let routes = client.get_all_routes();
+        assert_eq!(routes.len(), 3);
+        
+        // Count occurrences of each route name
+        let mut oracle_count = 0;
+        let mut vault_count = 0;
+        let mut swap_count = 0;
+        for route in routes.iter() {
+            if route == oracle {
+                oracle_count += 1;
+            } else if route == vault {
+                vault_count += 1;
+            } else if route == swap {
+                swap_count += 1;
+            }
+        }
+        
+        assert_eq!(oracle_count, 1, "oracle should appear exactly once");
+        assert_eq!(vault_count, 1, "vault should appear exactly once");
+        assert_eq!(swap_count, 1, "swap should appear exactly once");
+    // ── Issue #511: Route validation tests ───────────────────────────────────
+
+    #[test]
+    fn test_validate_route_name_rejects_empty_string() {
+        let (env, admin, client) = setup();
+        let empty_name = String::from_str(&env, "");
+        let addr = Address::generate(&env);
+        let result = client.try_register_route(&admin, &empty_name, &addr, &None);
+        assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+
+    #[test]
+    fn test_validate_route_name_rejects_whitespace_only() {
+        let (env, admin, client) = setup();
+        let whitespace_name = String::from_str(&env, "   ");
+        let addr = Address::generate(&env);
+        let result = client.try_register_route(&admin, &whitespace_name, &addr, &None);
+        assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+
+    #[test]
+    fn test_validate_route_name_prevents_duplicate_route() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        
+        client.register_route(&admin, &name, &addr1, &None);
+        let result = client.try_register_route(&admin, &name, &addr2, &None);
+        assert_eq!(result, Err(Ok(RouterError::RouteAlreadyExists)));
+    }
+
+    #[test]
+    fn test_validate_route_name_prevents_alias_as_route() {
+        let (env, admin, client) = setup();
+        let route_name = String::from_str(&env, "oracle");
+        let alias_name = String::from_str(&env, "oracle_v1");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        
+        // Register route and create alias
+        client.register_route(&admin, &route_name, &addr1, &None);
+        client.add_alias(&admin, &route_name, &alias_name);
+        
+        // Try to register a route with the same name as the alias
+        let result = client.try_register_route(&admin, &alias_name, &addr2, &None);
+        assert_eq!(result, Err(Ok(RouterError::RouteAlreadyExists)));
+    }
+
+    #[test]
+    fn test_validate_route_name_prevents_route_as_alias() {
+        let (env, admin, client) = setup();
+        let route1 = String::from_str(&env, "oracle");
+        let route2 = String::from_str(&env, "vault");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        
+        // Register two routes
+        client.register_route(&admin, &route1, &addr1, &None);
+        client.register_route(&admin, &route2, &addr2, &None);
+        
+        // Try to create an alias with the same name as an existing route
+        let result = client.try_add_alias(&admin, &route1, &route2);
+        assert_eq!(result, Err(Ok(RouterError::RouteAlreadyExists)));
+    }
+
+    #[test]
+    fn test_validate_route_name_alias_empty_string_fails() {
+        let (env, admin, client) = setup();
+        let route_name = String::from_str(&env, "oracle");
+        let empty_alias = String::from_str(&env, "");
+        let addr = Address::generate(&env);
+        
+        client.register_route(&admin, &route_name, &addr, &None);
+        let result = client.try_add_alias(&admin, &route_name, &empty_alias);
+        assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+
+    #[test]
+    fn test_validate_route_name_alias_whitespace_fails() {
+        let (env, admin, client) = setup();
+        let route_name = String::from_str(&env, "oracle");
+        let whitespace_alias = String::from_str(&env, "\t\n ");
+        let addr = Address::generate(&env);
+        
+        client.register_route(&admin, &route_name, &addr, &None);
+        let result = client.try_add_alias(&admin, &route_name, &whitespace_alias);
+        assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
     }
 }
