@@ -34,6 +34,7 @@ pub enum DataKey {
     TotalCalls,
     CallLog(String),        // route_name -> CallLogState
     ConfiguredRoutes,       // Vec<String>
+    CallLogSummary(String), // route_name -> CallLogSummary
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -104,6 +105,15 @@ pub struct CallLogState {
     pub entries: Vec<CallLogEntry>,
     /// Index of the oldest entry in `entries` (0 when not wrapped)
     pub head: u32,
+/// Aggregated summary for a route's call log.
+/// Maintained incrementally to avoid loading all entries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallLogSummary {
+    pub total_calls: u32,
+    pub success_count: u32,
+    pub failure_count: u32,
+    pub last_call_timestamp: u64,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -450,6 +460,28 @@ impl RouterMiddleware {
                 env.storage()
                     .instance()
                     .set(&DataKey::CallLog(route.clone()), &log);
+
+                // Update summary incrementally (avoids reloading all entries)
+                let mut summary: CallLogSummary = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CallLogSummary(route.clone()))
+                    .unwrap_or(CallLogSummary {
+                        total_calls: 0,
+                        success_count: 0,
+                        failure_count: 0,
+                        last_call_timestamp: 0,
+                    });
+                summary.total_calls += 1;
+                if success {
+                    summary.success_count += 1;
+                } else {
+                    summary.failure_count += 1;
+                }
+                summary.last_call_timestamp = env.ledger().timestamp();
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CallLogSummary(route.clone()), &summary);
             }
         }
 
@@ -625,6 +657,24 @@ impl RouterMiddleware {
             .get::<DataKey, CallLogState>(&DataKey::CallLog(route))
             .map(|log| log.entries.len())
             .unwrap_or(0)
+    }
+
+    /// Get an aggregated summary of call log stats for a route.
+    ///
+    /// Returns total calls, success count, failure count, and last call timestamp
+    /// without loading all log entries. The summary is maintained incrementally
+    /// by `post_call` whenever log retention is enabled for the route.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `route` - The route name to summarize.
+    ///
+    /// # Returns
+    /// `Some(CallLogSummary)` if any calls have been logged, `None` otherwise.
+    pub fn get_call_log_summary(env: Env, route: String) -> Option<CallLogSummary> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CallLogSummary(route))
     }
 
     /// Clear all call log entries for a route.
@@ -1550,4 +1600,63 @@ mod tests {
         let emitted: bool = last.2.into_val(&env);
         assert!(!emitted);
     }
-}
+
+    // ── Issue #449: get_call_log_summary ─────────────────────────────────────
+
+    #[test]
+    fn test_get_call_log_summary_none_before_calls() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &5);
+        assert_eq!(client.get_call_log_summary(&route), None);
+    }
+
+    #[test]
+    fn test_get_call_log_summary_counts_correctly() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &10);
+
+        client.post_call(&caller, &route, &true);
+        client.post_call(&caller, &route, &true);
+        client.post_call(&caller, &route, &false);
+
+        let summary = client.get_call_log_summary(&route).unwrap();
+        assert_eq!(summary.total_calls, 3);
+        assert_eq!(summary.success_count, 2);
+        assert_eq!(summary.failure_count, 1);
+    }
+
+    #[test]
+    fn test_get_call_log_summary_last_call_timestamp() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &10);
+
+        env.ledger().set_timestamp(1000);
+        client.post_call(&caller, &route, &true);
+        env.ledger().set_timestamp(2000);
+        client.post_call(&caller, &route, &false);
+
+        let summary = client.get_call_log_summary(&route).unwrap();
+        assert_eq!(summary.last_call_timestamp, 2000);
+    }
+
+    #[test]
+    fn test_get_call_log_summary_not_affected_by_retention_limit() {
+        // Summary counts all calls ever, even when the log is capped by retention
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &2); // retain only 2
+
+        for _ in 0..5 {
+            client.post_call(&caller, &route, &true);
+        }
+
+        let summary = client.get_call_log_summary(&route).unwrap();
+        assert_eq!(summary.total_calls, 5); // all 5 counted
+        assert_eq!(client.get_call_log(&route).len(), 2); // only 2 retained
+    }

@@ -245,6 +245,7 @@ pub enum QuoteError {
     InvalidSlippage = 5,
     EmptyRoute = 6,
     RouteTooLong = 7,
+    TokenMismatch = 8,
 }
 
 // Maximum hops allowed in a multi-hop route. Keeps gas costs bounded.
@@ -411,6 +412,18 @@ impl RouterQuote {
         }
         if slippage_bps > 10_000 {
             return Err(QuoteError::InvalidSlippage);
+        }
+
+        // Validate token continuity: hop[N].token_out must equal hop[N+1].token_in
+        let hop_count = hops.len();
+        let mut i = 0u32;
+        while i + 1 < hop_count {
+            let current = hops.get(i).unwrap();
+            let next = hops.get(i + 1).unwrap();
+            if current.token_out != next.token_in {
+                return Err(QuoteError::TokenMismatch);
+            }
+            i += 1;
         }
 
         Self::execute_hops(&env, hops, amount_in, slippage_bps, precision)
@@ -692,11 +705,10 @@ impl RouterQuote {
         env: Env,
         router_core: Option<Address>,
         requests: Vec<QuoteRequest>,
-    ) -> Vec<QuoteResponse> {
+    ) -> Vec<Result<QuoteResponse, QuoteError>> {
         let mut responses = Vec::new(&env);
-        
         for req in requests.iter() {
-            let response = Self::get_quote(
+            let result = Self::get_quote(
                 env.clone(),
                 router_core.clone(),
                 req.route_name.clone(),
@@ -705,25 +717,8 @@ impl RouterQuote {
                 req.amount_in,
                 req.slippage_bps,
             );
-            
-            match response {
-                Ok(quote) => responses.push_back(quote),
-                Err(_) => {
-                    // On failure, add a zero quote (caller can check amount_out == 0)
-                    responses.push_back(QuoteResponse {
-                        amount_out: 0,
-                        fee_amount: 0,
-                        route_name: req.route_name.clone(),
-                        target: req.route_name.clone().try_into().unwrap_or(Address::from_contract_id(&env, &[0u8; 32])),
-                        min_amount_out: 0,
-                        exchange_rate: String::from_str(&env, "0"),
-                        price_impact_bps: 0,
-                        expires_at: env.ledger().timestamp(),
-                    });
-                }
-            }
+            responses.push_back(result);
         }
-        
         responses
     }
 
@@ -1015,6 +1010,21 @@ mod tests {
     }
 
     #[test]
+    fn test_multihop_token_mismatch_fails() {
+        let (env, client, double, triple) = setup();
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let tc = Address::generate(&env);
+        let td = Address::generate(&env); // unrelated token — breaks chain
+
+        // Hop 1: A → B, Hop 2: C → D (B != C → TokenMismatch)
+        let mut hops = soroban_sdk::Vec::new(&env);
+        hops.push_back(HopDescriptor { plugin: double, token_in: ta, token_out: tb, fee_bps: 0 });
+        hops.push_back(HopDescriptor { plugin: triple, token_in: tc, token_out: td, fee_bps: 0 });
+
+        let r = client.try_get_multihop_quote(&hops, &1000, &0, &6);
+        assert_eq!(r, Err(Ok(QuoteError::TokenMismatch)));
+    }    #[test]
     fn test_multihop_too_many_hops_fails() {
         let (env, client, double, _) = setup();
         let ta = Address::generate(&env);
