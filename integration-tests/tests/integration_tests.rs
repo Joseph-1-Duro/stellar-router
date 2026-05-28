@@ -44,7 +44,7 @@ mod integration {
 
 #[cfg(test)]
 mod quick_tests {
-    use super::integration::testnet_setup::TestAccount;
+    use super::integration::testnet_setup::{DeployedContract, TestAccount};
 
     #[test]
     #[ignore]
@@ -91,10 +91,60 @@ mod quick_tests {
         println!("✓ Generated account: {}", account.address);
 
         account
-            .fund()
+            .fund("testnet")
             .expect("Failed to fund account via Friendbot");
         println!("✓ Account funded successfully");
 
         println!("\n=== Account Setup Test PASSED ===\n");
+    }
+
+    /// End-to-end: deploy router-core, initialize, register a route, resolve it,
+    /// and assert the returned address matches what was registered.
+    #[test]
+    #[ignore]
+    fn test_router_core_register_and_resolve() {
+        let network = "testnet";
+        let wasm = "target/wasm32-unknown-unknown/release/router_core.wasm";
+        assert!(
+            std::path::Path::new(wasm).exists(),
+            "router_core.wasm not found — run: cargo build --target wasm32-unknown-unknown --release"
+        );
+
+        let admin = TestAccount::generate().expect("generate admin");
+        admin.fund(network).expect("fund admin");
+
+        let core = DeployedContract::deploy(wasm, "router-core", &admin, network)
+            .expect("deploy router-core");
+
+        core.invoke("initialize", &["--admin", &admin.address], &admin, network)
+            .expect("initialize router-core");
+
+        // Use a freshly generated address as the mock contract target
+        let target = TestAccount::generate().expect("generate target").address;
+
+        core.invoke(
+            "register_route",
+            &[
+                "--caller", &admin.address,
+                "--name", "oracle",
+                "--address", &target,
+                "--metadata", "null",
+            ],
+            &admin,
+            network,
+        )
+        .expect("register_route");
+
+        let resolved = core
+            .invoke("resolve", &["--name", "oracle"], &admin, network)
+            .expect("resolve");
+
+        assert!(
+            resolved.contains(&target),
+            "resolved address '{}' does not match registered target '{}'",
+            resolved,
+            target
+        );
+        println!("✓ router-core register+resolve PASSED: {}", resolved);
     }
 }
