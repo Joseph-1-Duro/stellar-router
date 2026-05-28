@@ -1,12 +1,12 @@
 use axum::{
     extract::{
-        ws::{WebSocket, WebSocketUpgrade},
+        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::stream::FuturesUnordered;
 use serde_json::json;
 use tracing::{error, info, warn};
 
@@ -23,28 +23,25 @@ pub async fn ws_handler(
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
-/// Handle WebSocket connection
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
 
     info!("WebSocket client connected");
 
     let mut subscriptions: Vec<String> = Vec::new();
-    let mut rx_handles: Vec<(String, tokio::sync::broadcast::Receiver<TransactionStatusEvent>)> =
-        Vec::new();
+    let mut rx_handles: Vec<(String, tokio::sync::broadcast::Receiver<TransactionStatusEvent>)> = Vec::new();
 
     loop {
         tokio::select! {
             msg = receiver.next() => {
                 match msg {
-                    Some(Ok(axum::extract::ws::Message::Text(text))) => {
+                    Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<SubscribeMessage>(&text) {
                             Ok(sub_msg) => {
                                 if sub_msg.action == "subscribe" {
                                     info!("Client subscribed to tx_id: {}", sub_msg.tx_id);
                                     subscriptions.push(sub_msg.tx_id.clone());
                                     state.add_subscriber(sub_msg.tx_id.clone());
-
                                     let rx = state.tx_status_tx.subscribe();
                                     rx_handles.push((sub_msg.tx_id.clone(), rx));
 
@@ -52,13 +49,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         "msg_type": "subscribed",
                                         "data": {
                                             "tx_id": sub_msg.tx_id,
-                                            "status": "subscribed"
-                                        }
+                                            "status": "subscribed",
+                                        },
                                     });
 
-                                    if let Err(e) = sender.send(axum::extract::ws::Message::Text(
-                                        response.to_string().into(),
-                                    )).await {
+                                    if let Err(e) = sender.send(Message::Text(response.to_string())).await {
                                         error!("Failed to send subscription confirmation: {}", e);
                                         break;
                                     }
@@ -74,7 +69,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                         }
                     }
-                    Some(Ok(axum::extract::ws::Message::Close(_))) | None => {
+                    Some(Ok(Message::Close(_))) | None => {
                         info!("WebSocket client disconnected");
                         for tx_id in &subscriptions {
                             state.remove_subscriber(tx_id);
@@ -88,7 +83,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     _ => {}
                 }
             }
-
             result = async {
                 for (tx_id, rx) in &mut rx_handles {
                     if let Ok(event) = rx.try_recv() {
@@ -102,31 +96,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 } else {
                     std::future::pending().await
-            // Handle broadcast messages — poll all receivers concurrently
-            // without busy-looping by using FuturesUnordered.
-            result = async {
-                if rx_handles.is_empty() {
-                    std::future::pending::<Option<(String, TransactionStatusEvent)>>().await
-                } else {
-                    let mut futs: FuturesUnordered<_> = rx_handles
-                        .iter_mut()
-                        .map(|(tx_id, rx)| {
-                            let id = tx_id.clone();
-                            async move {
-                                match rx.recv().await {
-                                    Ok(event) => Some((id, event)),
-                                    Err(_) => None,
-                                }
-                            }
-                        })
-                        .collect();
-                    loop {
-                        match futs.next().await {
-                            Some(Some(pair)) => return Some(pair),
-                            Some(None) => continue,
-                            None => return None,
-                        }
-                    }
                 }
             } => {
                 if let Some((_tx_id, event)) = result {
@@ -136,13 +105,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             "tx_id": event.tx_id,
                             "status": event.status,
                             "timestamp": event.timestamp,
-                            "message": event.message
-                        }
+                            "message": event.message,
+                        },
                     });
 
-                    if let Err(e) = sender.send(axum::extract::ws::Message::Text(
-                        response.to_string().into(),
-                    )).await {
+                    if let Err(e) = sender.send(Message::Text(response.to_string())).await {
                         error!("Failed to send status update: {}", e);
                         break;
                     }

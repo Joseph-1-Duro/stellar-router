@@ -2,20 +2,14 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use crate::types::TransactionStatusEvent;
+use crate::{rpc::SorobanRpcClient, types::TransactionStatusEvent};
 
-/// Shared application state
 #[derive(Clone)]
 pub struct AppState {
-    /// Soroban RPC endpoint URL
-    pub rpc_url: String,
-    /// Router execution contract ID
+    pub rpc: SorobanRpcClient,
     pub execution_contract_id: String,
-    /// Router core contract ID (used for GET /routes)
     pub router_core_contract_id: String,
-    /// Broadcast channel for transaction status updates
     pub tx_status_tx: broadcast::Sender<TransactionStatusEvent>,
-    /// Map of transaction ID to subscribers
     pub tx_subscribers: Arc<DashMap<String, usize>>,
 }
 
@@ -27,7 +21,7 @@ impl AppState {
     ) -> Self {
         let (tx_status_tx, _) = broadcast::channel(1000);
         Self {
-            rpc_url,
+            rpc: SorobanRpcClient::new(rpc_url, Some(router_core_contract_id.clone())),
             execution_contract_id,
             router_core_contract_id,
             tx_status_tx,

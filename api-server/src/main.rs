@@ -8,11 +8,7 @@ mod websocket;
 mod tests;
 
 use anyhow::{Context, Result};
-use axum::{
-    extract::DefaultBodyLimit,
-    routing::{get, post},
-    Router,
-};
+use axum::{extract::DefaultBodyLimit, routing::{get, post}, Router};
 use clap::Parser;
 use std::net::SocketAddr;
 use tracing::info;
@@ -65,8 +61,9 @@ async fn main() -> Result<()> {
         .route("/health", get(handlers::health))
         .route("/simulate", post(handlers::simulate))
         .route("/routes", get(handlers::list_routes))
+        .route("/routes/:name", get(handlers::get_route))
         .route("/ws", get(websocket::ws_handler))
-        .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB limit
+        .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state);
 
     let addr: SocketAddr = args
