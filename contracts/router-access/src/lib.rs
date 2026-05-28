@@ -629,6 +629,27 @@ impl RouterAccess {
 
     /// Revoke a role from multiple accounts in one call.
     ///
+    /// Calls [`Self::revoke_role`] for each target and returns `Ok(())` only
+    /// if all revocations succeed.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not super-admin or role admin.
+    /// * [`AccessError::RoleNotFound`] — a target does not hold the role directly.
+    pub fn bulk_revoke_role(
+        env: Env,
+        caller: Address,
+        role: String,
+        targets: Vec<Address>,
+    ) -> Result<(), AccessError> {
+        caller.require_auth();
+        for target in targets.iter() {
+            Self::revoke_role(env.clone(), caller.clone(), role.clone(), target.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Revoke a role from multiple accounts in one call.
+    ///
     /// Returns a vector of per-account results so partial failures are visible.
     ///
     /// # Errors
