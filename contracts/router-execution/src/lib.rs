@@ -21,6 +21,18 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Fixed-point scale factor used for multiplier arithmetic (100 = 1.0×).
+/// e.g. backoff_multiplier=200 means 2.0×, 150 means 1.5×.
+const FIXED_POINT_SCALE: u32 = 100;
+
+/// Minimum valid backoff multiplier: 100 = 1.0× (no growth, constant delay).
+const MIN_BACKOFF_MULTIPLIER: u32 = FIXED_POINT_SCALE;
+
+/// Base network fee in stroops — the Stellar network minimum transaction fee.
+const BASE_FEE_STROOPS: i128 = 100;
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -201,7 +213,7 @@ impl RouterExecution {
         if max_retries > 5 {
             return Err(ExecutionError::InvalidConfig);
         }
-        if backoff_multiplier < 100 {
+        if backoff_multiplier < MIN_BACKOFF_MULTIPLIER {
             return Err(ExecutionError::InvalidConfig);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -231,7 +243,7 @@ impl RouterExecution {
     ) -> Result<(), ExecutionError> {
         caller.require_auth();
         router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, ExecutionError)?;
-        if backoff_multiplier < 100 {
+        if backoff_multiplier < MIN_BACKOFF_MULTIPLIER {
             return Err(ExecutionError::InvalidConfig);
         }
         env.storage().instance().set(&DataKey::BackoffBaseMs, &backoff_base_ms);
@@ -244,7 +256,7 @@ impl RouterExecution {
     /// Returns `(backoff_base_ms, backoff_multiplier)`.
     pub fn backoff_config(env: Env) -> (u64, u32) {
         let base: u64 = env.storage().instance().get(&DataKey::BackoffBaseMs).unwrap_or(0);
-        let mult: u32 = env.storage().instance().get(&DataKey::BackoffMultiplier).unwrap_or(100);
+        let mult: u32 = env.storage().instance().get(&DataKey::BackoffMultiplier).unwrap_or(FIXED_POINT_SCALE);
         (base, mult)
     }
 
@@ -408,9 +420,23 @@ impl RouterExecution {
             (SURGE_MULTIPLIER, true)
         } else {
             (NORMAL_MULTIPLIER, false)
+        // Base fee: minimum Stellar network fee in stroops
+        let base_fee: i128 = BASE_FEE_STROOPS;
+
+        // Resource fee scales with amount (0.1% of amount, min BASE_FEE_STROOPS)
+        let resource_fee: i128 = {
+            let scaled = amount / 1000;
+            if scaled < BASE_FEE_STROOPS { BASE_FEE_STROOPS } else { scaled }
         };
 
-        let total_fee = (base_fee + resource_fee) * surge_multiplier as i128 / 100;
+        // Surge pricing: if high_load_threshold >= 8000 bps (80%), apply 2x multiplier
+        let (surge_multiplier, high_load) = if high_load_threshold >= 8000 {
+            (FIXED_POINT_SCALE * 2, true)
+        } else {
+            (FIXED_POINT_SCALE, false)
+        };
+
+        let total_fee = (base_fee + resource_fee) * surge_multiplier as i128 / FIXED_POINT_SCALE as i128;
 
         env.events().publish(
             (Symbol::new(&env, "fee_estimated"),),
@@ -593,7 +619,7 @@ impl RouterExecution {
     pub(crate) fn compute_backoff_ms(base_ms: u64, multiplier: u32, attempt_index: u32) -> u64 {
         let mut delay = base_ms;
         for _ in 0..attempt_index {
-            delay = delay.saturating_mul(multiplier as u64) / 100;
+            delay = delay.saturating_mul(multiplier as u64) / FIXED_POINT_SCALE as u64;
         }
         delay
     }
