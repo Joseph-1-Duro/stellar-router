@@ -48,6 +48,7 @@ pub enum DataKey {
     Aliases,          // Vec<String> of all alias names
     Score(String),    // name -> RouteScore
     Metadata(String), // name -> RouteMetadata (stored separately; avoids nested contracttype)
+    BestRoute,        // cached name of the highest-scoring non-paused route, if any
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -380,6 +381,9 @@ impl RouterCore {
         }
         env.storage().instance().set(&DataKey::Aliases, &updated_aliases);
 
+        // Removing a route may invalidate the cached best route; refresh it.
+        Self::recompute_best_route(&env);
+
         env.events()
             .publish((Symbol::new(&env, "route_removed"),), name.clone());
 
@@ -535,6 +539,9 @@ impl RouterCore {
                 .publish((Symbol::new(&env, "route_removed"),), name.clone());
         }
 
+        // Removing routes may invalidate the cached best route; refresh it once.
+        Self::recompute_best_route(&env);
+
         Ok(())
     }
 
@@ -545,10 +552,10 @@ impl RouterCore {
     /// total-routed counter, and emits a `routed` event. If `name` is an alias,
     /// resolves to the original route.
     ///
-    /// When multiple scored routes exist, score-based selection is applied:
-    /// all route names are evaluated via `get_best_route` and the highest-scoring
-    /// non-paused route is returned automatically. If no scored routes exist,
-    /// falls back to the direct lookup by `name`.
+    /// When scored routes exist, score-based selection is applied via a cached
+    /// best-route key (maintained on score/pause/removal changes): the
+    /// highest-scoring non-paused route is returned automatically in O(1). If no
+    /// scored, non-paused route exists, falls back to the direct lookup by `name`.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -582,27 +589,17 @@ impl RouterCore {
             name.clone()
         };
 
-        // Score-based selection: if any route has a score, use get_best_route
-        // across all candidates to return the highest-scoring non-paused route.
-        let all_names = Self::get_route_names(&env);
-        let has_any_score = all_names
-            .iter()
-            .any(|n| env.storage().instance().has(&DataKey::Score(n.clone())));
-
-        let final_name = if has_any_score {
-            // Use score-based selection over all routes; fall back to resolved_name
-            match Self::get_best_route(
-                env.clone(),
-                all_names,
-                i64::MIN,
-                Some(resolved_name.clone()),
-            )? {
-                Some(best) => best,
-                None => resolved_name.clone(),
-            }
-        } else {
-            resolved_name.clone()
-        };
+        // Score-based selection: the best non-paused scored route is maintained
+        // in a cached storage key (DataKey::BestRoute), updated whenever scores,
+        // pause state, or routes change. This keeps resolution O(1) instead of
+        // scanning the entire RouteNames vector on every call. If no scored,
+        // non-paused route exists, the cache is absent and we fall back to the
+        // directly requested route.
+        let final_name = env
+            .storage()
+            .instance()
+            .get::<DataKey, String>(&DataKey::BestRoute)
+            .unwrap_or(resolved_name);
 
         let entry: RouteEntry = env
             .storage()
@@ -677,6 +674,9 @@ impl RouterCore {
 
         env.events()
             .publish((Symbol::new(&env, "route_paused"),), (name.clone(), paused));
+
+        // Pause state affects best-route eligibility; refresh the cache.
+        Self::recompute_best_route(&env);
 
         Ok(())
     }
@@ -999,6 +999,39 @@ impl RouterCore {
         Self::get_route_names(&env)
     }
 
+    /// Returns a page of registered route names.
+    ///
+    /// Avoids loading the entire `RouteNames` vector into the caller when the
+    /// route set is large. Returns up to `limit` names starting at index
+    /// `start`. An out-of-range `start` or a `limit` of zero yields an empty
+    /// vector. The order matches [`get_all_routes`] and is not otherwise
+    /// guaranteed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `start` - Zero-based index of the first route name to return.
+    /// * `limit` - Maximum number of names to return.
+    ///
+    /// # Returns
+    /// A `Vec<String>` containing up to `limit` route names.
+    pub fn get_routes_paginated(env: Env, start: u32, limit: u32) -> Vec<String> {
+        let names = Self::get_route_names(&env);
+        let total = names.len();
+        let mut page = Vec::new(&env);
+
+        if start >= total || limit == 0 {
+            return page;
+        }
+
+        let end = start.saturating_add(limit).min(total);
+        let mut i = start;
+        while i < end {
+            page.push_back(names.get(i).unwrap());
+            i += 1;
+        }
+        page
+    }
+
     /// Returns the canonical route name that `alias_name` points to, or `None`.
     ///
     /// This is a read-only lookup that does not increment `total_routed` and
@@ -1052,6 +1085,9 @@ impl RouterCore {
             (Symbol::new(&env, "route_scored"),),
             (name, score.liquidity_score, score.fee_bps, score.reliability_score),
         );
+
+        // Scoring can change which route is best; refresh the cache.
+        Self::recompute_best_route(&env);
 
         Ok(())
     }
@@ -1189,6 +1225,62 @@ impl RouterCore {
             .instance()
             .get(&DataKey::Aliases)
             .unwrap_or(Vec::new(env))
+    }
+
+    /// Recompute and cache the highest-scoring, non-paused route.
+    ///
+    /// Performs a single O(n) scan over all routes and stores the winner under
+    /// [`DataKey::BestRoute`] (or removes the key when no scored, non-paused
+    /// route exists). This is called only from write paths that can change the
+    /// outcome — scoring, pausing, and route removal — so that the hot
+    /// [`resolve`] path can read the result in O(1).
+    fn recompute_best_route(env: &Env) {
+        let names = Self::get_route_names(env);
+        let mut best_name: Option<String> = None;
+        let mut best_score: i64 = i64::MIN;
+
+        for name in names.iter() {
+            // Skip missing or paused routes
+            match env
+                .storage()
+                .instance()
+                .get::<DataKey, RouteEntry>(&DataKey::Route(name.clone()))
+            {
+                Some(e) if !e.paused => {}
+                _ => continue,
+            }
+
+            // Skip routes without a score
+            let score: RouteScore = match env
+                .storage()
+                .instance()
+                .get(&DataKey::Score(name.clone()))
+            {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Composite score: liquidity + reliability - fee_bps/10
+            let composite: i64 = score.liquidity_score as i64
+                + score.reliability_score as i64
+                - (score.fee_bps as i64 / 10);
+
+            if composite > best_score {
+                best_score = composite;
+                best_name = Some(name.clone());
+            }
+        }
+
+        match best_name {
+            Some(name) => {
+                env.storage().instance().set(&DataKey::BestRoute, &name);
+                env.events().publish(
+                    (Symbol::new(env, "best_route_selected"),),
+                    (name, best_score),
+                );
+            }
+            None => env.storage().instance().remove(&DataKey::BestRoute),
+        }
     }
 
     /// Returns `true` if `name` is empty or consists entirely of ASCII whitespace
@@ -2828,5 +2920,118 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results.get(0).unwrap(), BatchResolveResult::Ok(addr));
+    }
+
+    // ── Issue #582: cached best-route selection & pagination ──────────────────
+
+    #[test]
+    fn test_resolve_uses_cached_best_route() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.register_route(&admin, &r2, &addr2, &None);
+
+        // r2 scores higher than r1
+        client.set_route_score(&admin, &r1, &RouteScore { liquidity_score: 50, fee_bps: 30, reliability_score: 50 });
+        client.set_route_score(&admin, &r2, &RouteScore { liquidity_score: 90, fee_bps: 10, reliability_score: 90 });
+
+        // Resolving any route name returns the globally best scored route.
+        assert_eq!(client.resolve(&r1), addr2);
+        assert_eq!(client.resolve(&r2), addr2);
+    }
+
+    #[test]
+    fn test_cached_best_route_updates_when_best_paused() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.register_route(&admin, &r2, &addr2, &None);
+        client.set_route_score(&admin, &r1, &RouteScore { liquidity_score: 50, fee_bps: 30, reliability_score: 50 });
+        client.set_route_score(&admin, &r2, &RouteScore { liquidity_score: 90, fee_bps: 10, reliability_score: 90 });
+
+        // Initially r2 is best.
+        assert_eq!(client.resolve(&r1), addr2);
+
+        // Pausing the best route promotes r1 in the cache.
+        client.set_route_paused(&admin, &r2, &true);
+        assert_eq!(client.resolve(&r1), addr1);
+    }
+
+    #[test]
+    fn test_cached_best_route_updates_on_remove() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.register_route(&admin, &r2, &addr2, &None);
+        client.set_route_score(&admin, &r1, &RouteScore { liquidity_score: 50, fee_bps: 30, reliability_score: 50 });
+        client.set_route_score(&admin, &r2, &RouteScore { liquidity_score: 90, fee_bps: 10, reliability_score: 90 });
+
+        assert_eq!(client.resolve(&r1), addr2);
+
+        // Removing the best route falls back to the next-best.
+        client.remove_route(&admin, &r2);
+        assert_eq!(client.resolve(&r1), addr1);
+    }
+
+    #[test]
+    fn test_resolve_without_scores_uses_requested_route() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.register_route(&admin, &r2, &addr2, &None);
+
+        // No scores set: each name resolves to its own address.
+        assert_eq!(client.resolve(&r1), addr1);
+        assert_eq!(client.resolve(&r2), addr2);
+    }
+
+    #[test]
+    fn test_get_routes_paginated_basic() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let r3 = String::from_str(&env, "route-c");
+        client.register_route(&admin, &r1, &addr, &None);
+        client.register_route(&admin, &r2, &addr, &None);
+        client.register_route(&admin, &r3, &addr, &None);
+
+        // First page of two.
+        let page = client.get_routes_paginated(&0, &2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap(), r1);
+        assert_eq!(page.get(1).unwrap(), r2);
+
+        // Second page returns the remaining one.
+        let page = client.get_routes_paginated(&2, &2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap(), r3);
+    }
+
+    #[test]
+    fn test_get_routes_paginated_edge_cases() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        let r1 = String::from_str(&env, "route-a");
+        client.register_route(&admin, &r1, &addr, &None);
+
+        // start past the end -> empty
+        assert_eq!(client.get_routes_paginated(&5, &10).len(), 0);
+        // zero limit -> empty
+        assert_eq!(client.get_routes_paginated(&0, &0).len(), 0);
+        // limit larger than remaining -> clamped
+        assert_eq!(client.get_routes_paginated(&0, &100).len(), 1);
     }
 }
