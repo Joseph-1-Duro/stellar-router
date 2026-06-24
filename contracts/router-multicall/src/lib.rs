@@ -239,11 +239,15 @@ impl RouterMulticall {
 
             env.events().publish(
                 (Symbol::new(&env, "call_result"),),
-                (&caller, &call.target, &call.function, success),
+                (&caller, &call.target, &call.function, success, call_index),
             );
 
             if !success {
                 if call.required {
+                    env.events().publish(
+                        (Symbol::new(&env, "call_failed"),),
+                        (call_index, &call.target, &call.function),
+                    );
                     env.storage().instance().remove(&DataKey::Executing);
                     return Err(MulticallError::RequiredCallFailed);
                 }
@@ -789,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn test_call_result_event_includes_caller() {
+    fn test_call_result_event_includes_caller_and_index() {
             let (env, _admin, client) = setup();
             let mock_id = env.register_contract(None, MockContract);
             let caller = Address::generate(&env);
@@ -805,7 +809,6 @@ mod tests {
 
             client.execute_batch(&caller, &calls, &false, &false, &false);
 
-            // Find the call_result event — tuple is (contract_id, topics: Vec<Val>, data: Val)
             let all_events = env.events().all();
             let (_, _, data) = all_events
                 .iter()
@@ -817,12 +820,61 @@ mod tests {
                 })
                 .expect("call_result event not found");
 
-            // Data is a Vec<Val>; decode first element as Address and assert it equals caller
             let data_vec = soroban_sdk::Vec::<soroban_sdk::Val>::from_val(&env, &data);
             let event_caller = Address::from_val(&env, &data_vec.get(0).unwrap());
+            let event_index = u32::from_val(&env, &data_vec.get(4).unwrap());
 
             assert_eq!(event_caller, caller);
+            assert_eq!(event_index, 0u32);
         }
+
+    #[test]
+    fn test_call_failed_event_emitted_with_index_and_contract() {
+        let (env, _admin, client) = setup();
+        let mock_id = env.register_contract(None, MockContract);
+        let caller = Address::generate(&env);
+
+        let mut calls = Vec::new(&env);
+        // index 0: optional success
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: false,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        // index 1: required failure — should emit call_failed
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "fail"),
+            required: true,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+
+        let result = client.try_execute_batch(&caller, &calls, &false, &false, &false);
+        assert_eq!(result, Err(Ok(MulticallError::RequiredCallFailed)));
+
+        let all_events = env.events().all();
+        let (_, _, data) = all_events
+            .iter()
+            .find(|(_, topics, _)| {
+                topics
+                    .get(0)
+                    .map(|v| Symbol::from_val(&env, &v) == Symbol::new(&env, "call_failed"))
+                    .unwrap_or(false)
+            })
+            .expect("call_failed event not found");
+
+        let data_vec = soroban_sdk::Vec::<soroban_sdk::Val>::from_val(&env, &data);
+        let event_index = u32::from_val(&env, &data_vec.get(0).unwrap());
+        let event_contract = Address::from_val(&env, &data_vec.get(1).unwrap());
+        let event_function = Symbol::from_val(&env, &data_vec.get(2).unwrap());
+
+        assert_eq!(event_index, 1u32);
+        assert_eq!(event_contract, mock_id);
+        assert_eq!(event_function, Symbol::new(&env, "fail"));
+    }
 
     #[test]
     fn test_total_batches_not_incremented_when_required_call_fails() {
