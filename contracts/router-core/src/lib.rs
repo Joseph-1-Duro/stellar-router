@@ -22,6 +22,8 @@
 //! - `routed` — Route resolved (route_name, address)
 //! - `router_paused` — Router globally paused/unpaused (paused)
 //! - `metadata_updated` — Route metadata updated (route_name, metadata)
+//! - `route_tag_added` — Route tag added (route_name, tag)
+//! - `route_tag_removed` — Route tag removed (route_name, tag)
 //! - `alias_added` — Route alias added (existing_name, alias_name)
 //! - `alias_removed` — Route alias removed (alias_name)
 //! - `route_scored` — Route score updated (route_name, score)
@@ -789,6 +791,142 @@ impl RouterCore {
         env.storage()
             .instance()
             .get::<DataKey, RouteMetadata>(&DataKey::Metadata(name))
+    }
+
+    /// Return all route names whose metadata includes `tag`.
+    ///
+    /// This read-only lookup scans registered route metadata and returns the
+    /// names of routes tagged with `tag`. Routes without metadata are skipped.
+    pub fn get_routes_by_tag(env: Env, tag: String) -> Vec<String> {
+        let mut routes = Vec::new(&env);
+
+        for name in Self::get_route_names(&env).iter() {
+            if let Some(metadata) = env
+                .storage()
+                .instance()
+                .get::<DataKey, RouteMetadata>(&DataKey::Metadata(name.clone()))
+            {
+                if metadata.tags.contains(&tag) {
+                    routes.push_back(name);
+                }
+            }
+        }
+
+        routes
+    }
+
+    /// Add `tag` to an existing route's metadata.
+    ///
+    /// Caller must be the admin. Duplicate tags are ignored, making the call
+    /// idempotent. If the route has no metadata yet, metadata is created with
+    /// an empty description and the caller as owner.
+    pub fn add_route_tag(
+        env: Env,
+        caller: Address,
+        name: String,
+        tag: String,
+    ) -> Result<(), RouterError> {
+        caller.require_auth();
+        router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, RouterError)?;
+
+        if !env.storage().instance().has(&DataKey::Route(name.clone())) {
+            return Err(RouterError::RouteNotFound);
+        }
+
+        let mut metadata = env
+            .storage()
+            .instance()
+            .get::<DataKey, RouteMetadata>(&DataKey::Metadata(name.clone()))
+            .unwrap_or(RouteMetadata {
+                description: String::from_str(&env, ""),
+                tags: Vec::new(&env),
+                owner: caller.clone(),
+            });
+
+        if !metadata.tags.contains(&tag) {
+            metadata.tags.push_back(tag.clone());
+            Self::validate_metadata(&metadata)?;
+            env.storage()
+                .instance()
+                .set(&DataKey::Metadata(name.clone()), &metadata);
+
+            env.events().publish(
+                (Symbol::new(&env, "route_tag_added"),),
+                (name, tag),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Remove `tag` from an existing route's metadata.
+    ///
+    /// Caller must be the admin. Removing a tag that is not present is a no-op
+    /// as long as the route exists.
+    pub fn remove_route_tag(
+        env: Env,
+        caller: Address,
+        name: String,
+        tag: String,
+    ) -> Result<(), RouterError> {
+        caller.require_auth();
+        router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, RouterError)?;
+
+        if !env.storage().instance().has(&DataKey::Route(name.clone())) {
+            return Err(RouterError::RouteNotFound);
+        }
+
+        if let Some(mut metadata) = env
+            .storage()
+            .instance()
+            .get::<DataKey, RouteMetadata>(&DataKey::Metadata(name.clone()))
+        {
+            let mut updated_tags = Vec::new(&env);
+            let mut removed = false;
+
+            for existing_tag in metadata.tags.iter() {
+                if existing_tag == tag {
+                    removed = true;
+                } else {
+                    updated_tags.push_back(existing_tag);
+                }
+            }
+
+            if removed {
+                metadata.tags = updated_tags;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Metadata(name.clone()), &metadata);
+
+                env.events().publish(
+                    (Symbol::new(&env, "route_tag_removed"),),
+                    (name, tag),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Return every unique tag currently used by route metadata.
+    pub fn get_all_tags(env: Env) -> Vec<String> {
+        let mut tags = Vec::new(&env);
+
+        for name in Self::get_route_names(&env).iter() {
+            if let Some(metadata) = env
+                .storage()
+                .instance()
+                .get::<DataKey, RouteMetadata>(&DataKey::Metadata(name))
+            {
+                for tag in metadata.tags.iter() {
+                    if !tags.contains(&tag) {
+                        tags.push_back(tag);
+                    }
+                }
+            }
+        }
+
+        tags
     }
 
     /// Get the total number of resolved calls.
@@ -3224,5 +3362,168 @@ mod tests {
         assert_eq!(client.get_routes_paginated(&0, &0).len(), 0);
         // limit larger than remaining -> clamped
         assert_eq!(client.get_routes_paginated(&0, &100).len(), 1);
+    }
+
+    #[test]
+    fn test_get_routes_by_tag_returns_matching_routes() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        let dex = String::from_str(&env, "dex");
+        let lending = String::from_str(&env, "lending");
+        let stable = String::from_str(&env, "stable");
+        let route_a = String::from_str(&env, "swap-a");
+        let route_b = String::from_str(&env, "swap-b");
+        let route_c = String::from_str(&env, "loan-a");
+
+        client.register_route(
+            &admin,
+            &route_a,
+            &addr,
+            &Some(RouteMetadata {
+                description: String::from_str(&env, "Swap route A"),
+                tags: vec![&env, dex.clone(), stable],
+                owner: admin.clone(),
+            }),
+        );
+        client.register_route(
+            &admin,
+            &route_b,
+            &addr,
+            &Some(RouteMetadata {
+                description: String::from_str(&env, "Swap route B"),
+                tags: vec![&env, dex.clone()],
+                owner: admin.clone(),
+            }),
+        );
+        client.register_route(
+            &admin,
+            &route_c,
+            &addr,
+            &Some(RouteMetadata {
+                description: String::from_str(&env, "Lending route"),
+                tags: vec![&env, lending.clone()],
+                owner: admin.clone(),
+            }),
+        );
+
+        let dex_routes = client.get_routes_by_tag(&dex);
+        assert_eq!(dex_routes.len(), 2);
+        assert_eq!(dex_routes.get(0).unwrap(), route_a);
+        assert_eq!(dex_routes.get(1).unwrap(), route_b);
+
+        let lending_routes = client.get_routes_by_tag(&lending);
+        assert_eq!(lending_routes.len(), 1);
+        assert_eq!(lending_routes.get(0).unwrap(), route_c);
+    }
+
+    #[test]
+    fn test_add_route_tag_updates_metadata_and_is_idempotent() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let tag = String::from_str(&env, "stable");
+        let addr = Address::generate(&env);
+
+        client.register_route(&admin, &name, &addr, &None);
+        client.add_route_tag(&admin, &name, &tag);
+        client.add_route_tag(&admin, &name, &tag);
+
+        let metadata = client.get_metadata(&name).unwrap();
+        assert_eq!(metadata.tags.len(), 1);
+        assert_eq!(metadata.tags.get(0).unwrap(), tag);
+
+        let routes = client.get_routes_by_tag(&tag);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes.get(0).unwrap(), name);
+    }
+
+    #[test]
+    fn test_remove_route_tag_updates_lookup() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let dex = String::from_str(&env, "dex");
+        let stable = String::from_str(&env, "stable");
+        let addr = Address::generate(&env);
+
+        client.register_route(
+            &admin,
+            &name,
+            &addr,
+            &Some(RouteMetadata {
+                description: String::from_str(&env, "Oracle route"),
+                tags: vec![&env, dex.clone(), stable.clone()],
+                owner: admin.clone(),
+            }),
+        );
+
+        client.remove_route_tag(&admin, &name, &dex);
+
+        assert_eq!(client.get_routes_by_tag(&dex).len(), 0);
+
+        let stable_routes = client.get_routes_by_tag(&stable);
+        assert_eq!(stable_routes.len(), 1);
+        assert_eq!(stable_routes.get(0).unwrap(), name);
+    }
+
+    #[test]
+    fn test_get_all_tags_returns_unique_tags() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        let dex = String::from_str(&env, "dex");
+        let stable = String::from_str(&env, "stable");
+        let beta = String::from_str(&env, "beta");
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+
+        client.register_route(
+            &admin,
+            &r1,
+            &addr,
+            &Some(RouteMetadata {
+                description: String::from_str(&env, "Route A"),
+                tags: vec![&env, dex.clone(), stable.clone()],
+                owner: admin.clone(),
+            }),
+        );
+        client.register_route(
+            &admin,
+            &r2,
+            &addr,
+            &Some(RouteMetadata {
+                description: String::from_str(&env, "Route B"),
+                tags: vec![&env, dex.clone(), beta.clone()],
+                owner: admin.clone(),
+            }),
+        );
+
+        let tags = client.get_all_tags();
+        assert_eq!(tags.len(), 3);
+        assert!(tags.contains(&dex));
+        assert!(tags.contains(&stable));
+        assert!(tags.contains(&beta));
+    }
+
+    #[test]
+    fn test_route_tag_writes_require_admin_and_existing_route() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let missing = String::from_str(&env, "missing");
+        let tag = String::from_str(&env, "dex");
+        let addr = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        client.register_route(&admin, &name, &addr, &None);
+
+        assert_eq!(
+            client.try_add_route_tag(&attacker, &name, &tag),
+            Err(Ok(RouterError::Unauthorized))
+        );
+        assert_eq!(
+            client.try_add_route_tag(&admin, &missing, &tag),
+            Err(Ok(RouterError::RouteNotFound))
+        );
+        assert_eq!(
+            client.try_remove_route_tag(&admin, &missing, &tag),
+            Err(Ok(RouterError::RouteNotFound))
+        );
     }
 }
