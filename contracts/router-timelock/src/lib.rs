@@ -24,8 +24,8 @@ use soroban_sdk::{
 pub enum DataKey {
     Admin,
     MinDelay,
-    Op(Bytes),          // op_id -> Op
-    PendingOps,         // Vec<Bytes> — IDs of ops that are neither executed nor cancelled
+    Op(Bytes),  // op_id -> Op
+    PendingOps, // Vec<Bytes> — IDs of ops that are neither executed nor cancelled
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -177,8 +177,10 @@ impl RouterTimelock {
             .instance()
             .set(&DataKey::Op(op_id.clone()), &op);
 
-        env.events()
-            .publish((Symbol::new(&env, router_common::EVENT_OP_CANCELLED),), op_id);
+        env.events().publish(
+            (Symbol::new(&env, router_common::EVENT_OP_CANCELLED),),
+            op_id,
+        );
 
         Ok(())
     }
@@ -217,8 +219,10 @@ impl RouterTimelock {
             .instance()
             .set(&DataKey::Op(op_id.clone()), &op);
 
-        env.events()
-            .publish((Symbol::new(&env, router_common::EVENT_OP_EXECUTED),), (op_id, op.target));
+        env.events().publish(
+            (Symbol::new(&env, router_common::EVENT_OP_EXECUTED),),
+            (op_id, op.target),
+        );
 
         Ok(())
     }
@@ -257,7 +261,10 @@ impl RouterTimelock {
             .set(&DataKey::Op(op_id.clone()), &op);
 
         env.events().publish(
-            (Symbol::new(&env, router_common::EVENT_OP_DESCRIPTION_UPDATED),),
+            (Symbol::new(
+                &env,
+                router_common::EVENT_OP_DESCRIPTION_UPDATED,
+            ),),
             (op_id, new_description),
         );
 
@@ -360,9 +367,7 @@ impl RouterTimelock {
                     OperationStatus::Cancelled => op.cancelled,
                     OperationStatus::Executed => op.executed,
                     OperationStatus::Expired => {
-                        !op.executed
-                            && !op.cancelled
-                            && now > op.eta + op.grace_period_seconds
+                        !op.executed && !op.cancelled && now > op.eta + op.grace_period_seconds
                     }
                     OperationStatus::Ready => {
                         !op.executed
@@ -370,9 +375,7 @@ impl RouterTimelock {
                             && now >= op.eta
                             && now <= op.eta + op.grace_period_seconds
                     }
-                    OperationStatus::Queued => {
-                        !op.executed && !op.cancelled && now < op.eta
-                    }
+                    OperationStatus::Queued => !op.executed && !op.cancelled && now < op.eta,
                 };
                 if matches {
                     count += 1;
@@ -455,9 +458,7 @@ impl RouterTimelock {
             .unwrap_or_else(|| Vec::new(env));
         if !pending.iter().any(|id| id == *op_id) {
             pending.push_back(op_id.clone());
-            env.storage()
-                .instance()
-                .set(&DataKey::PendingOps, &pending);
+            env.storage().instance().set(&DataKey::PendingOps, &pending);
         }
     }
 }
@@ -723,7 +724,10 @@ mod tests {
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
         let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
-        assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Queued));
+        assert_eq!(
+            client.get_operation_status(&op_id),
+            Some(OperationStatus::Queued)
+        );
     }
 
     #[test]
@@ -735,7 +739,10 @@ mod tests {
         let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         // Past ETA but still within grace period
         env.ledger().with_mut(|l| l.timestamp += 3601);
-        assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Ready));
+        assert_eq!(
+            client.get_operation_status(&op_id),
+            Some(OperationStatus::Ready)
+        );
     }
 
     #[test]
@@ -747,7 +754,10 @@ mod tests {
         let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         env.ledger().with_mut(|l| l.timestamp += 3601);
         client.execute(&admin, &op_id);
-        assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Executed));
+        assert_eq!(
+            client.get_operation_status(&op_id),
+            Some(OperationStatus::Executed)
+        );
     }
 
     #[test]
@@ -758,7 +768,10 @@ mod tests {
         let deps = Vec::new(&env);
         let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         client.cancel(&admin, &op_id);
-        assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Cancelled));
+        assert_eq!(
+            client.get_operation_status(&op_id),
+            Some(OperationStatus::Cancelled)
+        );
     }
 
     #[test]
@@ -772,7 +785,10 @@ mod tests {
         let op_id = client.queue(&admin, &desc, &target, &3600, &grace, &deps);
         // Jump past eta + grace_period_seconds
         env.ledger().with_mut(|l| l.timestamp += 3600 + grace + 1);
-        assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Expired));
+        assert_eq!(
+            client.get_operation_status(&op_id),
+            Some(OperationStatus::Expired)
+        );
     }
 
     #[test]
@@ -790,7 +806,14 @@ mod tests {
         let target = Address::generate(&env);
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &GRACE, &deps);
+        let op_id = client.queue(
+            &admin,
+            &String::from_str(&env, "initial desc"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
         let new_desc = String::from_str(&env, "corrected desc");
         client.update_description(&admin, &op_id, &new_desc);
 
@@ -804,7 +827,14 @@ mod tests {
         let target = Address::generate(&env);
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &GRACE, &deps);
+        let op_id = client.queue(
+            &admin,
+            &String::from_str(&env, "initial desc"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
         let new_desc = String::from_str(&env, "corrected desc");
         client.update_description(&admin, &op_id, &new_desc);
 
@@ -812,7 +842,10 @@ mod tests {
         let last = events.last().unwrap();
 
         let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
-        assert_eq!(topic, Symbol::new(&env, router_common::EVENT_OP_DESCRIPTION_UPDATED));
+        assert_eq!(
+            topic,
+            Symbol::new(&env, router_common::EVENT_OP_DESCRIPTION_UPDATED)
+        );
 
         let (emitted_id, emitted_desc): (Bytes, String) = last.2.into_val(&env);
         assert_eq!(emitted_id, op_id);
@@ -825,15 +858,19 @@ mod tests {
         let target = Address::generate(&env);
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &GRACE, &deps);
+        let op_id = client.queue(
+            &admin,
+            &String::from_str(&env, "initial desc"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
         env.ledger().with_mut(|l| l.timestamp += 3601);
         client.execute(&admin, &op_id);
 
-        let result = client.try_update_description(
-            &admin,
-            &op_id,
-            &String::from_str(&env, "too late"),
-        );
+        let result =
+            client.try_update_description(&admin, &op_id, &String::from_str(&env, "too late"));
         assert_eq!(result, Err(Ok(TimelockError::AlreadyExecuted)));
     }
 
@@ -843,14 +880,18 @@ mod tests {
         let target = Address::generate(&env);
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &GRACE, &deps);
+        let op_id = client.queue(
+            &admin,
+            &String::from_str(&env, "initial desc"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
         client.cancel(&admin, &op_id);
 
-        let result = client.try_update_description(
-            &admin,
-            &op_id,
-            &String::from_str(&env, "too late"),
-        );
+        let result =
+            client.try_update_description(&admin, &op_id, &String::from_str(&env, "too late"));
         assert_eq!(result, Err(Ok(TimelockError::Cancelled)));
     }
 
@@ -859,11 +900,8 @@ mod tests {
         let (env, admin, client) = setup();
         let fake_id = Bytes::from_array(&env, &[0u8; 32]);
 
-        let result = client.try_update_description(
-            &admin,
-            &fake_id,
-            &String::from_str(&env, "ghost op"),
-        );
+        let result =
+            client.try_update_description(&admin, &fake_id, &String::from_str(&env, "ghost op"));
         assert_eq!(result, Err(Ok(TimelockError::NotFound)));
     }
 
@@ -883,11 +921,8 @@ mod tests {
             &deps,
         );
 
-        let result = client.try_update_description(
-            &attacker,
-            &op_id,
-            &String::from_str(&env, "hacked"),
-        );
+        let result =
+            client.try_update_description(&attacker, &op_id, &String::from_str(&env, "hacked"));
         assert_eq!(result, Err(Ok(TimelockError::Unauthorized)));
     }
 
@@ -898,7 +933,14 @@ mod tests {
         let target = Address::generate(&env);
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &GRACE, &deps);
+        let op_id = client.queue(
+            &admin,
+            &String::from_str(&env, "initial desc"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
         env.ledger().with_mut(|l| l.timestamp += 3601);
 
         let new_desc = String::from_str(&env, "clarified before execution");
@@ -959,8 +1001,22 @@ mod tests {
         assert!(client.get_pending_operations().is_empty());
 
         // Queue two ops
-        let op1 = client.queue(&admin, &String::from_str(&env, "op1"), &target, &3600, &GRACE, &deps);
-        let op2 = client.queue(&admin, &String::from_str(&env, "op2"), &target, &3600, &GRACE, &deps);
+        let op1 = client.queue(
+            &admin,
+            &String::from_str(&env, "op1"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
+        let op2 = client.queue(
+            &admin,
+            &String::from_str(&env, "op2"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
 
         let pending = client.get_pending_operations();
         assert_eq!(pending.len(), 2);
@@ -982,17 +1038,43 @@ mod tests {
         let deps = Vec::new(&env);
 
         // Queue two ops
-        client.queue(&admin, &String::from_str(&env, "op1"), &target, &3600, &GRACE, &deps);
-        client.queue(&admin, &String::from_str(&env, "op2"), &target, &3600, &GRACE, &deps);
+        client.queue(
+            &admin,
+            &String::from_str(&env, "op1"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
+        client.queue(
+            &admin,
+            &String::from_str(&env, "op2"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
 
         // Both should be Queued
-        assert_eq!(client.get_operation_count_by_status(&OperationStatus::Queued), 2);
-        assert_eq!(client.get_operation_count_by_status(&OperationStatus::Ready), 0);
+        assert_eq!(
+            client.get_operation_count_by_status(&OperationStatus::Queued),
+            2
+        );
+        assert_eq!(
+            client.get_operation_count_by_status(&OperationStatus::Ready),
+            0
+        );
 
         // Advance past ETA — both become Ready
         env.ledger().with_mut(|l| l.timestamp += 3601);
-        assert_eq!(client.get_operation_count_by_status(&OperationStatus::Queued), 0);
-        assert_eq!(client.get_operation_count_by_status(&OperationStatus::Ready), 2);
+        assert_eq!(
+            client.get_operation_count_by_status(&OperationStatus::Queued),
+            0
+        );
+        assert_eq!(
+            client.get_operation_count_by_status(&OperationStatus::Ready),
+            2
+        );
     }
 
     #[test]
@@ -1002,12 +1084,25 @@ mod tests {
         let deps: Vec<Bytes> = Vec::new(&env);
         let grace: u64 = 3600;
 
-        client.queue(&admin, &String::from_str(&env, "expires"), &target, &3600, &grace, &deps);
+        client.queue(
+            &admin,
+            &String::from_str(&env, "expires"),
+            &target,
+            &3600,
+            &grace,
+            &deps,
+        );
 
         // Jump past grace period
         env.ledger().with_mut(|l| l.timestamp += 3600 + grace + 1);
-        assert_eq!(client.get_operation_count_by_status(&OperationStatus::Expired), 1);
-        assert_eq!(client.get_operation_count_by_status(&OperationStatus::Ready), 0);
+        assert_eq!(
+            client.get_operation_count_by_status(&OperationStatus::Expired),
+            1
+        );
+        assert_eq!(
+            client.get_operation_count_by_status(&OperationStatus::Ready),
+            0
+        );
     }
 
     #[test]
@@ -1017,7 +1112,14 @@ mod tests {
         let deps: Vec<Bytes> = Vec::new(&env);
         let grace: u64 = 3600;
 
-        client.queue(&admin, &String::from_str(&env, "expires"), &target, &3600, &grace, &deps);
+        client.queue(
+            &admin,
+            &String::from_str(&env, "expires"),
+            &target,
+            &3600,
+            &grace,
+            &deps,
+        );
 
         // Before grace period expires, it's pending
         env.ledger().with_mut(|l| l.timestamp += 3601);
@@ -1061,7 +1163,13 @@ mod tests {
         assert_eq!(client.get_pending_operations().len(), 1);
 
         // get_operation_count_by_status should reflect the state
-        assert_eq!(client.get_operation_count_by_status(&OperationStatus::Cancelled), 4);
-        assert_eq!(client.get_operation_count_by_status(&OperationStatus::Queued), 1);
+        assert_eq!(
+            client.get_operation_count_by_status(&OperationStatus::Cancelled),
+            4
+        );
+        assert_eq!(
+            client.get_operation_count_by_status(&OperationStatus::Queued),
+            1
+        );
     }
 }
