@@ -97,6 +97,15 @@ pub const EVENT_ROUTE_TAG_ADDED: &str = "route_tag_added";
 /// Standard event topic for route tag removals
 pub const EVENT_ROUTE_TAG_REMOVED: &str = "route_tag_removed";
 
+/// Standard event topic for route TTL being set at registration
+pub const EVENT_ROUTE_TTL_SET: &str = "route_ttl_set";
+
+/// Standard event topic for route TTL extensions
+pub const EVENT_ROUTE_TTL_EXTENDED: &str = "route_ttl_extended";
+
+/// Standard event topic for resolution attempts on an expired route
+pub const EVENT_ROUTE_RESOLVE_EXPIRED: &str = "route_resolve_expired";
+
 /// Standard event topic for role grants
 pub const EVENT_ROLE_GRANTED: &str = "role_granted";
 
