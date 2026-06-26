@@ -1379,6 +1379,19 @@ mod tests {
 
         // Queue 5 ops with unique descriptions to get unique op_ids
         let mut op_ids = Vec::new(&env);
+        for i in 0..5u64 {
+            let desc_str = std::format!("op_{}", i);
+            let desc = String::from_str(&env, &desc_str);
+            let op_id = client.queue(
+                &admin,
+                &desc,
+                &target,
+                &3600,
+                &grace,
+                &deps,
+            );
+            let id: Bytes = op_id;
+            op_ids.push_back(id);
         for i in 0..5u32 {
             let bytes = Bytes::from_array(&env, &[i; 32]);
             let op_id = client.queue(&admin, &String::from_str(&env, "op"), &target, &3600, &grace, &deps);
