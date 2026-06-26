@@ -8,16 +8,24 @@ mod websocket;
 mod tests;
 
 use anyhow::{Context, Result};
-use axum::{extract::DefaultBodyLimit, routing::{get, post}, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    http::{header, Method},
+    routing::{get, post},
+    Router,
+};
 use clap::Parser;
 use std::net::SocketAddr;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 
 use crate::state::AppState;
 
 #[derive(Parser, Debug)]
 #[command(name = "router-api-server")]
-#[command(about = "API server for stellar-router with transaction simulation and WebSocket tracking")]
+#[command(
+    about = "API server for stellar-router with transaction simulation and WebSocket tracking"
+)]
 struct Args {
     /// Listen address (default: 127.0.0.1:8080)
     #[arg(long, env = "LISTEN_ADDR", default_value = "127.0.0.1:8080")]
@@ -34,6 +42,11 @@ struct Args {
     /// Router core contract ID (for GET /routes)
     #[arg(long, env = "ROUTER_CORE_CONTRACT_ID", default_value = "")]
     router_core_contract_id: String,
+
+    /// Allowed CORS origins, comma-separated. Use "*" to allow any origin (dev only).
+    /// Omit to disable cross-origin requests (production default).
+    #[arg(long, env = "CORS_ORIGINS", value_delimiter = ',')]
+    cors_origins: Vec<String>,
 }
 
 #[tokio::main]
@@ -57,12 +70,15 @@ async fn main() -> Result<()> {
         args.router_core_contract_id,
     );
 
+    let cors = build_cors_layer(&args.cors_origins);
+
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/simulate", post(handlers::simulate))
         .route("/routes", get(handlers::list_routes))
         .route("/routes/:name", get(handlers::get_route))
         .route("/ws", get(websocket::ws_handler))
+        .layer(cors)
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state);
 
@@ -77,4 +93,25 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+fn build_cors_layer(origins: &[String]) -> CorsLayer {
+    let allow_methods = [Method::GET, Method::POST, Method::OPTIONS];
+    let allow_headers = [header::CONTENT_TYPE, header::AUTHORIZATION];
+
+    if origins.is_empty() {
+        return CorsLayer::new();
+    }
+
+    let allow_origin = if origins.iter().any(|o| o == "*") {
+        AllowOrigin::any()
+    } else {
+        let parsed: Vec<_> = origins.iter().filter_map(|o| o.parse().ok()).collect();
+        AllowOrigin::list(parsed)
+    };
+
+    CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods(allow_methods)
+        .allow_headers(allow_headers)
 }

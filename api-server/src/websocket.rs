@@ -6,7 +6,6 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use futures_util::stream::FuturesUnordered;
 use serde_json::json;
 use tracing::{error, info, warn};
 
@@ -16,10 +15,7 @@ use crate::{
 };
 
 /// WebSocket upgrade handler
-pub async fn ws_handler(
-    State(state): State<AppState>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
@@ -29,7 +25,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     info!("WebSocket client connected");
 
     let mut subscriptions: Vec<String> = Vec::new();
-    let mut rx_handles: Vec<(String, tokio::sync::broadcast::Receiver<TransactionStatusEvent>)> = Vec::new();
+    let mut rx_handles: Vec<(
+        String,
+        tokio::sync::broadcast::Receiver<TransactionStatusEvent>,
+    )> = Vec::new();
 
     loop {
         tokio::select! {
