@@ -70,9 +70,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         info!("WebSocket client disconnected");
-                        for tx_id in &subscriptions {
-                            state.remove_subscriber(tx_id);
-                        }
                         break;
                     }
                     Some(Err(e)) => {
@@ -115,6 +112,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
             }
         }
+    }
+
+    // Deferred cleanup: remove all subscriptions regardless of how the loop exited
+    // (normal Close/None, WebSocket error, or send failure).
+    for tx_id in &subscriptions {
+        state.remove_subscriber(tx_id);
     }
 
     info!("WebSocket handler exiting");

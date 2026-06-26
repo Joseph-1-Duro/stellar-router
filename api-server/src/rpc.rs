@@ -346,6 +346,18 @@ impl SorobanRpcClient {
 
     fn decode_string_vec_xdr(xdr: &str) -> Option<Vec<String>> {
         let bytes = base64_decode(xdr)?;
+        let mut result = Vec::new();
+        if bytes.len() < 8 {
+            return Some(result);
+        }
+        let count = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        let mut pos = 8usize;
+        for _ in 0..count {
+            if pos + 8 > bytes.len() {
+                break;
+            }
+            // Each string element: 4-byte type discriminant + 4-byte length + data (padded to 4)
+            pos += 4; // skip type discriminant
         // Parse a minimal XDR Vec<String>: 4-byte big-endian length, then null-terminated strings.
         if bytes.len() < 4 {
             return Some(Vec::new());
@@ -365,6 +377,11 @@ impl SorobanRpcClient {
                 break;
             }
             if let Ok(s) = std::str::from_utf8(&bytes[pos..pos + len]) {
+                result.push(s.to_string());
+            }
+            // Advance past padding to next 4-byte boundary
+            let padded = (len + 3) & !3;
+            pos += padded;
                 result.push(s.trim_end_matches('\0').to_string());
             }
             pos += (len + 3) & !3;
