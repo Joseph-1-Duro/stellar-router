@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "router-api-server"
 version = "0.1.0"
@@ -25,6 +27,6 @@ async-trait = { version = "0.1.88" }
 
 [dev-dependencies]
 axum-test = "15.0"
-tower = { version = "0.4" }
+tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.44.2", features = ["full"] }
 futures-util = { version = "0.3" }

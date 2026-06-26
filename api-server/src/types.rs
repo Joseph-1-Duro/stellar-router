@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulateRequest {
     /// Target contract address (56-char Stellar contract ID starting with C)
+    #[serde(default)]
     pub target: String,
     /// Function name to invoke
+    #[serde(default)]
     pub function: String,
     /// Transaction amount in stroops (used for fee estimation)
     #[serde(default = "default_amount")]
@@ -61,6 +63,7 @@ pub struct SimulationDetail {
     pub would_succeed: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteBreakdown {
     pub route_name: String,
@@ -117,6 +120,7 @@ pub struct SubscribeMessage {
     pub tx_id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsMessage {
     pub msg_type: String,

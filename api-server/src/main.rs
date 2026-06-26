@@ -8,7 +8,11 @@ mod websocket;
 mod tests;
 
 use anyhow::{Context, Result};
-use axum::{extract::DefaultBodyLimit, routing::{get, post}, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    routing::{get, post},
+    Router,
+};
 use clap::Parser;
 use std::net::SocketAddr;
 use tracing::info;
@@ -17,7 +21,9 @@ use crate::state::AppState;
 
 #[derive(Parser, Debug)]
 #[command(name = "router-api-server")]
-#[command(about = "API server for stellar-router with transaction simulation and WebSocket tracking")]
+#[command(
+    about = "API server for stellar-router with transaction simulation and WebSocket tracking"
+)]
 struct Args {
     /// Listen address (default: 127.0.0.1:8080)
     #[arg(long, env = "LISTEN_ADDR", default_value = "127.0.0.1:8080")]
